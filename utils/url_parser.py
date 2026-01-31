@@ -69,7 +69,7 @@ class URLParser:
                 return self._parse_818ps_share_url(clean_url, url)
             elif platform == "Canva":
                 return self._parse_canva_share_url(clean_url, url)
-            elif platform == "创可贴":
+            elif platform == "Chuangkit":
                 return self._parse_chuangkit_share_url(clean_url, url)
             elif platform == "抖音":
                 return self._parse_douyin_share_url(clean_url, url)
@@ -334,10 +334,10 @@ class URLParser:
         
         if '818ps.com' in url_lower or 'tuguaishou.com' in url_lower:
             return '818ps'
-        elif 'canva.com' in url_lower:
+        elif 'canva.com' in url_lower or 'canva.cn' in url_lower:
             return 'Canva'
-        elif 'chuangkit.com' in url_lower:
-            return '创可贴'
+        elif 'chuangkit.com' in url_lower or 'chuangkit.cn' in url_lower:
+            return 'Chuangkit'
         elif 'douyin.com' in url_lower or 'dy.com' in url_lower:
             return '抖音'
         elif 'xiaohongshu.com' in url_lower or 'xhs.com' in url_lower:
@@ -403,12 +403,12 @@ class URLParser:
         }
     
     def _parse_chuangkit_share_url(self, url: str, original_url: str) -> Dict:
-        """解析创可贴分享链接"""
+        """解析创客贴分享链接"""
         return {
             'success': True,
             'original_url': original_url,
             'parsed_url': url,
-            'platform': '创可贴',
+            'platform': 'Chuangkit',
             'type': 'direct'
         }
     

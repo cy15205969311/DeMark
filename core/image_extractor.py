@@ -12,6 +12,8 @@ from utils.image_validator import ImageValidator
 from utils.variant_builder import VariantBuilder
 from utils.url_parser import URLParser
 from crawlers.tuguaishou_818ps import Tuguaishou818psCrawler
+from crawlers.canva_crawler import CanvaCrawler
+from crawlers.chuangkit_crawler import ChuangkitCrawler
 
 class ImageExtractor:
     """
@@ -27,7 +29,9 @@ class ImageExtractor:
         
         # 平台特定爬虫
         self.crawlers = {
-            '818ps': Tuguaishou818psCrawler()
+            '818ps': Tuguaishou818psCrawler(),
+            'Canva': CanvaCrawler(),
+            'Chuangkit': ChuangkitCrawler()
         }
         
     async def extract_image(self, url: str, platform: str) -> Dict:
@@ -84,13 +88,22 @@ class ImageExtractor:
             
             local_result = await self._extract_local(processed_url, platform, extracted_params)
             
-            if local_result and local_result.get('imageUrl'):
-                logging.info("✅ 【成功】本地提取返回结果")
-                return {
-                    **local_result,
-                    'original_url': url,
-                    'processed_url': processed_url
-                }
+            if local_result:
+                # 检查是否是用户指导响应
+                if local_result.get('status') == 'manual_guidance':
+                    logging.info("🤝 【用户指导】本地提取返回用户指导")
+                    return {
+                        **local_result,
+                        'original_url': url,
+                        'processed_url': processed_url
+                    }
+                elif local_result.get('imageUrl'):
+                    logging.info("✅ 【成功】本地提取返回结果")
+                    return {
+                        **local_result,
+                        'original_url': url,
+                        'processed_url': processed_url
+                    }
                 
             # ========== 阶段3: Selenium隐身抓取 ==========
             logging.info("🤖 阶段3: 尝试Selenium隐身抓取...")
@@ -279,7 +292,7 @@ class ImageExtractor:
                 return await self._extract_818ps(url, parsed_params)
             elif platform == 'Canva':
                 return await self._extract_canva(url, parsed_params)
-            elif platform == '创可贴':
+            elif platform == 'Chuangkit':
                 return await self._extract_chuangkit(url, parsed_params)
             elif platform == '抖音':
                 return await self._extract_douyin(url, parsed_params)
@@ -395,12 +408,56 @@ class ImageExtractor:
     
     # 移除旧的单独提取方法，现在使用统一的爬虫架构
     async def _extract_canva(self, url: str, parsed_params: dict = None) -> Optional[Dict]:
-        """提取Canva图片 - 基础实现"""
-        return None
+        """
+        提取Canva图片 - 使用专用爬虫
+        
+        Args:
+            url: Canva模板URL
+            parsed_params: 预提取的参数 (对Canva暂时不使用)
+        
+        Returns:
+            提取结果字典或None
+        """
+        try:
+            logging.info(f"🎨 开始Canva本地提取: {url}")
+            
+            # 使用Canva专用爬虫
+            if 'Canva' in self.crawlers:
+                crawler = self.crawlers['Canva']
+                return await crawler.extract_image(url, parsed_params)
+            
+            logging.warning("❌ Canva爬虫未初始化")
+            return None
+            
+        except Exception as e:
+            logging.error(f"❌ Canva提取失败: {e}")
+            return None
     
     async def _extract_chuangkit(self, url: str, parsed_params: dict = None) -> Optional[Dict]:
-        """提取创可贴图片 - 基础实现"""
-        return None
+        """
+        提取创客贴图片 - 使用专用爬虫
+        
+        Args:
+            url: 创客贴设计稿URL
+            parsed_params: 预提取的参数 (对创客贴暂时不使用)
+        
+        Returns:
+            提取结果字典或None
+        """
+        try:
+            logging.info(f"🧩 开始创客贴本地提取: {url}")
+            
+            # 使用创客贴专用爬虫
+            if 'Chuangkit' in self.crawlers:
+                crawler = self.crawlers['Chuangkit']
+                return await crawler.extract_image(url, parsed_params)
+            
+            logging.warning("❌ 创客贴爬虫未初始化")
+            return None
+            
+        except Exception as e:
+            logging.error(f"❌ 创客贴提取失败: {e}")
+            return None
     
     async def _extract_douyin(self, url: str, parsed_params: dict = None) -> Optional[Dict]:
         """提取抖音图片 - 基础实现"""

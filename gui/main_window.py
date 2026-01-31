@@ -1,16 +1,18 @@
 """
-主窗口类 - 现代化界面设计
-集成三层架构提取器和实时日志显示
+主窗口类 - 现代卡片式 UI 设计
+Modern Card Layout with Dark Theme
 """
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import messagebox, filedialog
 import asyncio
 import threading
 from typing import Dict, List, Optional
 import logging
 import sys
 import os
+import webbrowser
+import json
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,284 +21,326 @@ from core.image_extractor import ImageExtractor
 
 class MainWindow:
     """
-    主窗口类 - 现代化界面设计
-    集成三层架构提取器和实时日志显示
+    主窗口类 - 现代卡片式 UI 设计
+    Modern Card Layout with Dark Theme
     """
     
     def __init__(self):
-        # 设置主题
+        # 设置现代深色主题
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         
         # 创建主窗口
         self.root = ctk.CTk()
-        self.root.title("🎨 多平台图片爬取工具 v2.0 - 基于成功Node.js逻辑")
+        self.root.title("🎨 DeMark - 现代图片提取工具")
         self.root.geometry("1400x900")
         self.root.minsize(1200, 800)
         
-        # 设置窗口图标和样式
-        try:
-            self.root.iconbitmap(default="")  # 可以添加图标文件
-        except:
-            pass
+        # 设置背景色
+        self.root.configure(fg_color="#1a1a1a")
         
         # 初始化组件
         self.extractor = ImageExtractor()
         self.results = []
         self.is_extracting = False
+        self.success_count = 0
+        self.fail_count = 0
         
         # 创建界面
         self._create_widgets()
         self._setup_logging()
         
+        # 显示空状态
+        self._update_empty_state()
+        
     def _create_widgets(self):
-        """创建界面组件"""
-        # 主容器
-        main_frame = ctk.CTkFrame(self.root)
-        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        """创建界面组件 - 使用 Grid 布局"""
+        # 配置主窗口的网格权重
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(0, weight=0)  # 控制卡片
+        self.root.grid_rowconfigure(1, weight=1)  # 结果画廊
+        self.root.grid_rowconfigure(2, weight=0)  # 日志抽屉
+        self.root.grid_rowconfigure(3, weight=0)  # 状态栏
         
-        # 顶部输入区域
-        self._create_input_section(main_frame)
+        # 1. 顶部控制卡片
+        self._create_control_card()
         
-        # 中间日志区域
-        self._create_log_section(main_frame)
+        # 2. 中部结果画廊
+        self._create_result_gallery()
         
-        # 底部结果区域
-        self._create_result_section(main_frame)
+        # 3. 底部日志抽屉
+        self._create_log_drawer()
         
-        # 状态栏
-        self._create_status_bar(main_frame)
+        # 4. 状态栏
+        self._create_status_bar()
     
-    def _create_input_section(self, parent):
-        """创建输入区域"""
-        input_frame = ctk.CTkFrame(parent, corner_radius=15)
-        input_frame.pack(fill="x", padx=10, pady=10)
+    def _create_control_card(self):
+        """创建顶部控制卡片"""
+        control_card = ctk.CTkFrame(
+            self.root,
+            fg_color="#2b2b2b",
+            corner_radius=10,
+            height=200
+        )
+        control_card.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
+        control_card.grid_propagate(False)
+        
+        # 配置内部网格
+        control_card.grid_columnconfigure(0, weight=1)
         
         # 标题区域
-        title_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
-        title_frame.pack(fill="x", padx=15, pady=(15, 10))
+        title_frame = ctk.CTkFrame(control_card, fg_color="transparent")
+        title_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
         
         title_label = ctk.CTkLabel(
-            title_frame, 
-            text="🎯 智能图片提取", 
-            font=("Microsoft YaHei UI", 18, "bold"),
-            text_color=("#1f538d", "#14375e")
+            title_frame,
+            text="🎯 智能图片提取器",
+            font=("Microsoft YaHei UI", 20, "bold"),
+            text_color="#3B8ED0"
         )
         title_label.pack(side="left")
         
-        # URL输入区域
-        url_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
-        url_frame.pack(fill="x", padx=15, pady=(0, 15))
+        # URL 输入区域
+        input_frame = ctk.CTkFrame(control_card, fg_color="transparent")
+        input_frame.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
+        input_frame.grid_columnconfigure(0, weight=1)
         
-        url_label = ctk.CTkLabel(
-            url_frame, 
-            text="📎 链接输入:", 
-            font=("Microsoft YaHei UI", 14, "bold")
-        )
-        url_label.pack(anchor="w", pady=(0, 8))
-        
-        # URL输入框和按钮
-        url_input_frame = ctk.CTkFrame(url_frame, fg_color="transparent")
-        url_input_frame.pack(fill="x", pady=(0, 15))
-        
+        # URL 输入框
         self.url_entry = ctk.CTkEntry(
-            url_input_frame, 
-            placeholder_text="🔗 请输入图怪兽、可画、创可贴、抖音或小红书的分享链接...",
+            input_frame,
+            placeholder_text="🔗 请输入图怪兽、Canva、创客贴等平台的分享链接...",
             font=("Microsoft YaHei UI", 12),
-            height=45,
-            corner_radius=10,
+            height=40,
+            corner_radius=8,
+            border_color="#3B8ED0",
             border_width=2
         )
-        self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.url_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         
+        # 提取按钮
         self.extract_btn = ctk.CTkButton(
-            url_input_frame,
+            input_frame,
             text="🚀 智能解析",
             command=self._on_extract_click,
-            font=("Microsoft YaHei UI", 13, "bold"),
-            height=45,
+            font=("Microsoft YaHei UI", 14, "bold"),
+            height=40,
             width=140,
-            corner_radius=10,
-            hover_color=("#1f538d", "#14375e")
+            corner_radius=8,
+            fg_color="#1f538d",
+            hover_color="#14375e"
         )
-        self.extract_btn.pack(side="right")
+        self.extract_btn.grid(row=0, column=1)
         
-        # 平台选择区域
-        platform_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
-        platform_frame.pack(fill="x", padx=15, pady=(0, 15))
+        # 平台选择区域 (分段按钮)
+        platform_frame = ctk.CTkFrame(control_card, fg_color="transparent")
+        platform_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=(10, 20))
         
-        platform_title = ctk.CTkLabel(
-            platform_frame, 
-            text="🎨 支持平台:", 
+        platform_label = ctk.CTkLabel(
+            platform_frame,
+            text="🎨 支持平台:",
             font=("Microsoft YaHei UI", 12, "bold")
         )
-        platform_title.pack(anchor="w", pady=(0, 8))
+        platform_label.pack(anchor="w", pady=(0, 8))
         
-        # 平台选择按钮组
-        platform_buttons_frame = ctk.CTkFrame(platform_frame, fg_color="transparent")
-        platform_buttons_frame.pack(fill="x")
-        
-        self.platform_var = tk.StringVar(value="auto")
-        platforms = [
-            ("🤖 自动识别", "auto"),
-            ("🎨 图怪兽", "818ps"),
-            ("🎭 可画", "Canva"),
-            ("📐 创可贴", "创可贴"),
-            ("🎵 抖音", "抖音"),
-            ("📱 小红书", "小红书")
-        ]
-        
-        for i, (text, value) in enumerate(platforms):
-            radio = ctk.CTkRadioButton(
-                platform_buttons_frame,
-                text=text,
-                variable=self.platform_var,
-                value=value,
-                font=("Microsoft YaHei UI", 11),
-                radiobutton_width=18,
-                radiobutton_height=18
-            )
-            radio.pack(side="left", padx=(0, 20), pady=5)
+        # 使用分段按钮替代传统单选按钮
+        self.platform_segmented = ctk.CTkSegmentedButton(
+            platform_frame,
+            values=["🤖 自动", "🎨 图怪兽", "🎭 Canva", "📐 创客贴", "🎵 抖音", "📱 小红书"],
+            font=("Microsoft YaHei UI", 11),
+            corner_radius=8,
+            border_width=2,
+            selected_color="#1f538d",
+            selected_hover_color="#14375e"
+        )
+        self.platform_segmented.pack(fill="x", pady=(0, 5))
+        self.platform_segmented.set("🤖 自动")  # 默认选择自动
     
-    def _create_log_section(self, parent):
-        """创建日志区域"""
-        log_frame = ctk.CTkFrame(parent, corner_radius=15)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    def _create_result_gallery(self):
+        """创建中部结果画廊"""
+        gallery_card = ctk.CTkFrame(
+            self.root,
+            fg_color="#232323",
+            corner_radius=10
+        )
+        gallery_card.grid(row=1, column=0, sticky="nsew", padx=20, pady=10)
+        
+        # 配置内部网格
+        gallery_card.grid_columnconfigure(0, weight=1)
+        gallery_card.grid_rowconfigure(1, weight=1)
+        
+        # 标题区域
+        gallery_header = ctk.CTkFrame(gallery_card, fg_color="transparent", height=50)
+        gallery_header.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
+        gallery_header.grid_propagate(False)
+        gallery_header.grid_columnconfigure(0, weight=1)
+        
+        gallery_title = ctk.CTkLabel(
+            gallery_header,
+            text="🖼️ 提取结果画廊",
+            font=("Microsoft YaHei UI", 16, "bold"),
+            text_color="#3B8ED0"
+        )
+        gallery_title.grid(row=0, column=0, sticky="w")
+        
+        # 控制按钮
+        gallery_controls = ctk.CTkFrame(gallery_header, fg_color="transparent")
+        gallery_controls.grid(row=0, column=1, sticky="e")
+        
+        self.export_btn = ctk.CTkButton(
+            gallery_controls,
+            text="📊 导出",
+            command=self._export_results,
+            width=80,
+            height=30,
+            corner_radius=6,
+            font=("Microsoft YaHei UI", 10)
+        )
+        self.export_btn.pack(side="right", padx=(10, 0))
+        
+        self.clear_results_btn = ctk.CTkButton(
+            gallery_controls,
+            text="🗑️ 清空",
+            command=self._clear_results,
+            width=80,
+            height=30,
+            corner_radius=6,
+            font=("Microsoft YaHei UI", 10),
+            fg_color="#8B4513",
+            hover_color="#A0522D"
+        )
+        self.clear_results_btn.pack(side="right")
+        
+        # 可滚动结果区域
+        self.result_scroll_frame = ctk.CTkScrollableFrame(
+            gallery_card,
+            fg_color="#1e1e1e",
+            corner_radius=8,
+            scrollbar_button_color="#1f538d",
+            scrollbar_button_hover_color="#14375e"
+        )
+        self.result_scroll_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        
+        # 配置滚动区域的网格 - 支持网格布局
+        self.result_scroll_frame.grid_columnconfigure(0, weight=1)
+        self.result_scroll_frame.grid_columnconfigure(1, weight=1)
+        self.result_scroll_frame.grid_columnconfigure(2, weight=1)
+    
+    def _create_log_drawer(self):
+        """创建底部日志抽屉"""
+        log_drawer = ctk.CTkFrame(
+            self.root,
+            fg_color="#2b2b2b",
+            corner_radius=10,
+            height=120
+        )
+        log_drawer.grid(row=2, column=0, sticky="ew", padx=20, pady=10)
+        log_drawer.grid_propagate(False)
+        
+        # 配置内部网格
+        log_drawer.grid_columnconfigure(0, weight=1)
+        log_drawer.grid_rowconfigure(1, weight=1)
         
         # 日志标题和控制
-        log_header = ctk.CTkFrame(log_frame, fg_color="transparent")
-        log_header.pack(fill="x", padx=15, pady=(15, 10))
+        log_header = ctk.CTkFrame(log_drawer, fg_color="transparent", height=40)
+        log_header.grid(row=0, column=0, sticky="ew", padx=15, pady=(15, 5))
+        log_header.grid_propagate(False)
+        log_header.grid_columnconfigure(0, weight=1)
         
         log_title = ctk.CTkLabel(
-            log_header, 
-            text="📋 实时日志", 
-            font=("Microsoft YaHei UI", 16, "bold"),
-            text_color=("#1f538d", "#14375e")
+            log_header,
+            text="📋 系统日志",
+            font=("Microsoft YaHei UI", 14, "bold"),
+            text_color="#3B8ED0"
         )
-        log_title.pack(side="left")
+        log_title.grid(row=0, column=0, sticky="w")
         
         # 日志控制按钮
         log_controls = ctk.CTkFrame(log_header, fg_color="transparent")
-        log_controls.pack(side="right")
+        log_controls.grid(row=0, column=1, sticky="e")
+        
+        export_log_btn = ctk.CTkButton(
+            log_controls,
+            text="💾 导出",
+            command=self._save_log,
+            width=60,
+            height=25,
+            corner_radius=6,
+            font=("Microsoft YaHei UI", 9)
+        )
+        export_log_btn.pack(side="right", padx=(8, 0))
         
         clear_log_btn = ctk.CTkButton(
             log_controls,
             text="🗑️ 清空",
             command=self._clear_log,
-            width=80,
-            height=30,
-            corner_radius=8,
-            font=("Microsoft YaHei UI", 10)
+            width=60,
+            height=25,
+            corner_radius=6,
+            font=("Microsoft YaHei UI", 9),
+            fg_color="#8B4513",
+            hover_color="#A0522D"
         )
-        clear_log_btn.pack(side="right", padx=(10, 0))
+        clear_log_btn.pack(side="right")
         
-        save_log_btn = ctk.CTkButton(
-            log_controls,
-            text="💾 保存",
-            command=self._save_log,
-            width=80,
-            height=30,
-            corner_radius=8,
-            font=("Microsoft YaHei UI", 10)
-        )
-        save_log_btn.pack(side="right")
-        
-        # 日志文本区域
-        log_text_frame = ctk.CTkFrame(log_frame, corner_radius=10)
-        log_text_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        # 日志文本区域 - 终端风格
+        log_text_frame = ctk.CTkFrame(log_drawer, fg_color="#000000", corner_radius=6)
+        log_text_frame.grid(row=1, column=0, sticky="nsew", padx=15, pady=(0, 15))
+        log_text_frame.grid_columnconfigure(0, weight=1)
+        log_text_frame.grid_rowconfigure(0, weight=1)
         
         self.log_text = tk.Text(
             log_text_frame,
-            bg="#1a1a1a",
-            fg="#ffffff",
+            bg="#000000",
+            fg="#00ff00",  # 绿色终端字体
             font=("Consolas", 10),
             wrap=tk.WORD,
             state=tk.DISABLED,
             relief="flat",
             borderwidth=0,
-            insertbackground="#ffffff",
+            insertbackground="#00ff00",
             selectbackground="#404040"
         )
+        self.log_text.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         
-        log_scrollbar = ctk.CTkScrollbar(log_text_frame, orientation="vertical", command=self.log_text.yview)
+        # 日志滚动条
+        log_scrollbar = ctk.CTkScrollbar(
+            log_text_frame,
+            orientation="vertical",
+            command=self.log_text.yview
+        )
         self.log_text.configure(yscrollcommand=log_scrollbar.set)
-        
-        self.log_text.pack(side="left", fill="both", expand=True, padx=10, pady=10)
-        log_scrollbar.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        log_scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
     
-    def _create_result_section(self, parent):
-        """创建结果展示区域"""
-        result_frame = ctk.CTkFrame(parent, corner_radius=15)
-        result_frame.pack(fill="x", padx=10, pady=(0, 10))
-        
-        # 结果标题和控制
-        result_header = ctk.CTkFrame(result_frame, fg_color="transparent")
-        result_header.pack(fill="x", padx=15, pady=(15, 10))
-        
-        result_title = ctk.CTkLabel(
-            result_header, 
-            text="🎯 提取结果", 
-            font=("Microsoft YaHei UI", 16, "bold"),
-            text_color=("#1f538d", "#14375e")
-        )
-        result_title.pack(side="left")
-        
-        # 结果控制按钮
-        result_controls = ctk.CTkFrame(result_header, fg_color="transparent")
-        result_controls.pack(side="right")
-        
-        export_btn = ctk.CTkButton(
-            result_controls,
-            text="📊 导出",
-            command=self._export_results,
-            width=80,
-            height=30,
-            corner_radius=8,
-            font=("Microsoft YaHei UI", 10)
-        )
-        export_btn.pack(side="right", padx=(10, 0))
-        
-        clear_results_btn = ctk.CTkButton(
-            result_controls,
-            text="🗑️ 清空",
-            command=self._clear_results,
-            width=80,
-            height=30,
-            corner_radius=8,
-            font=("Microsoft YaHei UI", 10)
-        )
-        clear_results_btn.pack(side="right")
-        
-        # 结果展示区域 (可滚动)
-        self.result_scroll_frame = ctk.CTkScrollableFrame(
-            result_frame, 
-            height=180,
+    def _create_status_bar(self):
+        """创建底部状态栏"""
+        status_bar = ctk.CTkFrame(
+            self.root,
+            fg_color="#2b2b2b",
             corner_radius=10,
-            scrollbar_button_color=("#1f538d", "#14375e")
+            height=50
         )
-        self.result_scroll_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
-    
-    def _create_status_bar(self, parent):
-        """创建状态栏"""
-        status_frame = ctk.CTkFrame(parent, corner_radius=10, height=50)
-        status_frame.pack(fill="x", padx=10, pady=(0, 10))
-        status_frame.pack_propagate(False)
+        status_bar.grid(row=3, column=0, sticky="ew", padx=20, pady=(10, 20))
+        status_bar.grid_propagate(False)
+        
+        # 配置内部网格
+        status_bar.grid_columnconfigure(0, weight=1)
         
         # 状态信息
-        status_info_frame = ctk.CTkFrame(status_frame, fg_color="transparent")
-        status_info_frame.pack(side="left", fill="both", expand=True, padx=15, pady=10)
+        status_info_frame = ctk.CTkFrame(status_bar, fg_color="transparent")
+        status_info_frame.grid(row=0, column=0, sticky="ew", padx=15, pady=10)
+        status_info_frame.grid_columnconfigure(0, weight=1)
         
         self.status_label = ctk.CTkLabel(
             status_info_frame,
-            text="🟢 状态: 就绪 | ✅ 成功: 0 | ❌ 失败: 0 | 📊 总计: 0",
+            text="🟢 就绪 | 成功: 0 | 失败: 0",
             font=("Microsoft YaHei UI", 11),
             anchor="w"
         )
-        self.status_label.pack(side="left", fill="x", expand=True)
+        self.status_label.grid(row=0, column=0, sticky="w")
         
         # 进度条区域
-        progress_frame = ctk.CTkFrame(status_frame, fg_color="transparent")
-        progress_frame.pack(side="right", padx=15, pady=10)
+        progress_frame = ctk.CTkFrame(status_info_frame, fg_color="transparent")
+        progress_frame.grid(row=0, column=1, sticky="e")
         
         progress_label = ctk.CTkLabel(
             progress_frame,
@@ -306,18 +350,59 @@ class MainWindow:
         progress_label.pack(side="left", padx=(0, 8))
         
         self.progress_bar = ctk.CTkProgressBar(
-            progress_frame, 
+            progress_frame,
             width=200,
-            height=16,
-            corner_radius=8,
-            progress_color=("#1f538d", "#14375e")
+            height=12,
+            corner_radius=6,
+            progress_color="#1f538d"
         )
         self.progress_bar.pack(side="right")
         self.progress_bar.set(0)
     
+    def _update_empty_state(self):
+        """更新空状态显示"""
+        # 清空现有内容
+        for widget in self.result_scroll_frame.winfo_children():
+            widget.destroy()
+        
+        if not self.results:
+            # 创建空状态显示
+            empty_frame = ctk.CTkFrame(
+                self.result_scroll_frame,
+                fg_color="transparent",
+                height=300
+            )
+            empty_frame.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=20, pady=50)
+            empty_frame.grid_propagate(False)
+            
+            # 空状态图标
+            empty_icon = ctk.CTkLabel(
+                empty_frame,
+                text="🖼️",
+                font=("Microsoft YaHei UI", 48)
+            )
+            empty_icon.pack(pady=(50, 20))
+            
+            # 空状态文字
+            empty_text = ctk.CTkLabel(
+                empty_frame,
+                text="暂无数据，请在上方输入链接开始抓取",
+                font=("Microsoft YaHei UI", 14),
+                text_color="gray60"
+            )
+            empty_text.pack()
+            
+            # 提示文字
+            hint_text = ctk.CTkLabel(
+                empty_frame,
+                text="支持图怪兽、Canva、创客贴、抖音、小红书等平台",
+                font=("Microsoft YaHei UI", 12),
+                text_color="gray40"
+            )
+            hint_text.pack(pady=(10, 0))
+    
     def _setup_logging(self):
         """设置日志系统"""
-        # 创建自定义日志处理器
         class GUILogHandler(logging.Handler):
             def __init__(self, text_widget):
                 super().__init__()
@@ -353,7 +438,16 @@ class MainWindow:
             messagebox.showerror("错误", "请输入URL")
             return
         
-        platform = self.platform_var.get()
+        # 获取选择的平台
+        platform_map = {
+            "🤖 自动": "auto",
+            "🎨 图怪兽": "818ps",
+            "🎭 Canva": "Canva",
+            "📐 创客贴": "Chuangkit",
+            "🎵 抖音": "抖音",
+            "📱 小红书": "小红书"
+        }
+        platform = platform_map.get(self.platform_segmented.get(), "auto")
         
         # 自动识别平台
         if platform == "auto":
@@ -361,7 +455,7 @@ class MainWindow:
         
         # 在后台线程中执行提取
         self.is_extracting = True
-        self.extract_btn.configure(text="提取中...", state="disabled")
+        self.extract_btn.configure(text="⏳ 提取中...", state="disabled")
         self.progress_bar.set(0.1)
         
         thread = threading.Thread(
@@ -417,9 +511,10 @@ class MainWindow:
         
         # 添加到结果列表
         self.results.append(result)
+        self.success_count += 1
         
-        # 创建结果卡片
-        self._create_result_card(result)
+        # 重新创建结果卡片
+        self._refresh_result_gallery()
         
         # 更新状态
         self._update_status()
@@ -429,8 +524,22 @@ class MainWindow:
     def _on_extract_error(self, error_msg: str):
         """提取失败回调"""
         logging.error(f"❌ 提取失败: {error_msg}")
-        messagebox.showerror("提取失败", f"无法提取图片:\n{error_msg}")
+        
+        # 添加失败记录
+        self.results.append({
+            'success': False,
+            'error': error_msg,
+            'platform': 'Unknown'
+        })
+        self.fail_count += 1
+        
+        # 重新创建结果卡片
+        self._refresh_result_gallery()
+        
+        # 更新状态
         self._update_status()
+        
+        messagebox.showerror("提取失败", f"无法提取图片:\n{error_msg}")
     
     def _reset_extract_button(self):
         """重置提取按钮"""
@@ -438,106 +547,173 @@ class MainWindow:
         self.extract_btn.configure(text="🚀 智能解析", state="normal")
         self.progress_bar.set(0)
     
-    def _create_result_card(self, result: Dict):
-        """创建结果卡片"""
-        card_frame = ctk.CTkFrame(self.result_scroll_frame, corner_radius=12)
-        card_frame.pack(fill="x", padx=5, pady=8)
+    def _refresh_result_gallery(self):
+        """刷新结果画廊"""
+        # 清空现有内容
+        for widget in self.result_scroll_frame.winfo_children():
+            widget.destroy()
         
-        # 主要信息区域
-        main_info_frame = ctk.CTkFrame(card_frame, fg_color="transparent")
-        main_info_frame.pack(fill="x", padx=15, pady=15)
+        if not self.results:
+            self._update_empty_state()
+            return
         
-        # 左侧状态图标
-        status_frame = ctk.CTkFrame(main_info_frame, width=60, height=60, corner_radius=30)
-        status_frame.pack(side="left", padx=(0, 15))
-        status_frame.pack_propagate(False)
+        # 创建网格布局的结果卡片
+        row = 0
+        col = 0
+        max_cols = 3  # 每行最多3个卡片
         
-        status_icon = "✅" if result.get('imageUrl') else "❌"
+        for i, result in enumerate(self.results):
+            self._create_result_card(result, row, col)
+            
+            col += 1
+            if col >= max_cols:
+                col = 0
+                row += 1
+    
+    def _create_result_card(self, result: Dict, row: int, col: int):
+        """创建结果卡片 - 网格布局"""
+        # 卡片容器
+        card = ctk.CTkFrame(
+            self.result_scroll_frame,
+            fg_color="#2b2b2b",
+            corner_radius=12,
+            width=350,
+            height=200
+        )
+        card.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
+        card.grid_propagate(False)
+        
+        # 配置卡片内部网格
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(1, weight=1)
+        
+        # 卡片头部
+        header = ctk.CTkFrame(card, fg_color="transparent", height=50)
+        header.grid(row=0, column=0, sticky="ew", padx=15, pady=(15, 5))
+        header.grid_propagate(False)
+        header.grid_columnconfigure(1, weight=1)
+        
+        # 状态图标
+        success = result.get('imageUrl') is not None
+        status_icon = "✅" if success else "❌"
+        status_color = "#2d8f2d" if success else "#d32f2f"
+        
+        status_frame = ctk.CTkFrame(
+            header,
+            fg_color=status_color,
+            width=40,
+            height=40,
+            corner_radius=20
+        )
+        status_frame.grid(row=0, column=0, sticky="w")
+        status_frame.grid_propagate(False)
+        
         status_label = ctk.CTkLabel(
             status_frame,
             text=status_icon,
-            font=("Microsoft YaHei UI", 24)
+            font=("Microsoft YaHei UI", 16)
         )
-        status_label.pack(expand=True)
+        status_label.place(relx=0.5, rely=0.5, anchor="center")
         
-        # 右侧信息区域
-        info_frame = ctk.CTkFrame(main_info_frame, fg_color="transparent")
-        info_frame.pack(side="left", fill="both", expand=True)
-        
-        # 平台和来源信息
-        platform_source_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
-        platform_source_frame.pack(fill="x", pady=(0, 8))
+        # 平台信息
+        platform_info = ctk.CTkFrame(header, fg_color="transparent")
+        platform_info.grid(row=0, column=1, sticky="ew", padx=(15, 0))
         
         platform_label = ctk.CTkLabel(
-            platform_source_frame,
+            platform_info,
             text=f"🎨 {result.get('platform', 'Unknown')}",
             font=("Microsoft YaHei UI", 14, "bold"),
-            text_color=("#1f538d", "#14375e")
-        )
-        platform_label.pack(side="left")
-        
-        source_label = ctk.CTkLabel(
-            platform_source_frame,
-            text=f"📡 {result.get('source', 'Unknown')}",
-            font=("Microsoft YaHei UI", 11),
-            text_color=("gray60", "gray40")
-        )
-        source_label.pack(side="right")
-        
-        # URL信息
-        url_text = result.get('imageUrl', '')
-        if len(url_text) > 80:
-            url_text = url_text[:80] + "..."
-        
-        url_label = ctk.CTkLabel(
-            info_frame,
-            text=f"🔗 {url_text}",
-            font=("Microsoft YaHei UI", 10),
-            text_color=("gray70", "gray30"),
+            text_color="#3B8ED0",
             anchor="w"
         )
-        url_label.pack(fill="x", pady=(0, 10))
+        platform_label.pack(fill="x")
         
-        # 操作按钮区域
-        btn_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
-        btn_frame.pack(fill="x")
-        
-        copy_btn = ctk.CTkButton(
-            btn_frame,
-            text="📋 复制链接",
-            command=lambda: self._copy_url(result.get('imageUrl')),
-            width=100,
-            height=32,
-            corner_radius=8,
+        source_label = ctk.CTkLabel(
+            platform_info,
+            text=f"📡 {result.get('source', 'Unknown')}",
             font=("Microsoft YaHei UI", 10),
-            hover_color=("#1f538d", "#14375e")
+            text_color="gray60",
+            anchor="w"
         )
-        copy_btn.pack(side="left", padx=(0, 10))
+        source_label.pack(fill="x")
         
-        if result.get('imageUrl'):
+        # 卡片内容
+        content = ctk.CTkFrame(card, fg_color="transparent")
+        content.grid(row=1, column=0, sticky="nsew", padx=15, pady=5)
+        content.grid_columnconfigure(0, weight=1)
+        
+        if success:
+            # 成功时显示URL
+            url_text = result.get('imageUrl', '')
+            if len(url_text) > 60:
+                url_text = url_text[:60] + "..."
+            
+            url_label = ctk.CTkLabel(
+                content,
+                text=f"🔗 {url_text}",
+                font=("Microsoft YaHei UI", 10),
+                text_color="gray70",
+                anchor="w",
+                wraplength=300
+            )
+            url_label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        else:
+            # 失败时显示错误信息
+            error_text = result.get('error', '未知错误')
+            if len(error_text) > 80:
+                error_text = error_text[:80] + "..."
+            
+            error_label = ctk.CTkLabel(
+                content,
+                text=f"❌ {error_text}",
+                font=("Microsoft YaHei UI", 10),
+                text_color="#ff6b6b",
+                anchor="w",
+                wraplength=300
+            )
+            error_label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        
+        # 操作按钮
+        if success:
+            btn_frame = ctk.CTkFrame(content, fg_color="transparent")
+            btn_frame.grid(row=1, column=0, sticky="ew")
+            
+            copy_btn = ctk.CTkButton(
+                btn_frame,
+                text="📋 复制",
+                command=lambda: self._copy_url(result.get('imageUrl')),
+                width=80,
+                height=28,
+                corner_radius=6,
+                font=("Microsoft YaHei UI", 9),
+                fg_color="#1f538d",
+                hover_color="#14375e"
+            )
+            copy_btn.pack(side="left", padx=(0, 8))
+            
             preview_btn = ctk.CTkButton(
                 btn_frame,
                 text="👁️ 预览",
                 command=lambda: self._preview_image(result.get('imageUrl')),
                 width=80,
-                height=32,
-                corner_radius=8,
-                font=("Microsoft YaHei UI", 10),
-                fg_color=("gray70", "gray30"),
-                hover_color=("gray60", "gray40")
+                height=28,
+                corner_radius=6,
+                font=("Microsoft YaHei UI", 9),
+                fg_color="gray60",
+                hover_color="gray50"
             )
-            preview_btn.pack(side="left", padx=(0, 10))
+            preview_btn.pack(side="left", padx=(0, 8))
             
             download_btn = ctk.CTkButton(
                 btn_frame,
                 text="⬇️ 下载",
                 command=lambda: self._download_image(result),
                 width=80,
-                height=32,
-                corner_radius=8,
-                font=("Microsoft YaHei UI", 10),
-                fg_color=("#2d8f2d", "#1e5f1e"),
-                hover_color=("#247a24", "#1a4f1a")
+                height=28,
+                corner_radius=6,
+                font=("Microsoft YaHei UI", 9),
+                fg_color="#2d8f2d",
+                hover_color="#1e5f1e"
             )
             download_btn.pack(side="left")
     
@@ -546,10 +722,10 @@ class MainWindow:
         url_lower = url.lower()
         if '818ps.com' in url_lower or 'tuguaishou.com' in url_lower:
             return '818ps'
-        elif 'canva.com' in url_lower:
+        elif 'canva.com' in url_lower or 'canva.cn' in url_lower:
             return 'Canva'
         elif 'chuangkit.com' in url_lower:
-            return '创可贴'
+            return 'Chuangkit'
         elif 'douyin.com' in url_lower or 'dy.com' in url_lower:
             return '抖音'
         elif 'xiaohongshu.com' in url_lower or 'xhs.com' in url_lower:
@@ -566,7 +742,6 @@ class MainWindow:
     def _save_log(self):
         """保存日志"""
         try:
-            from tkinter import filedialog
             filename = filedialog.asksaveasfilename(
                 defaultextension=".txt",
                 filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
@@ -587,8 +762,6 @@ class MainWindow:
             return
         
         try:
-            from tkinter import filedialog
-            import json
             filename = filedialog.asksaveasfilename(
                 defaultextension=".json",
                 filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")],
@@ -605,9 +778,9 @@ class MainWindow:
         """清空结果"""
         if messagebox.askyesno("确认", "确定要清空所有结果吗？"):
             self.results.clear()
-            # 清空结果显示区域
-            for widget in self.result_scroll_frame.winfo_children():
-                widget.destroy()
+            self.success_count = 0
+            self.fail_count = 0
+            self._update_empty_state()
             self._update_status()
     
     def _copy_url(self, url: str):
@@ -620,22 +793,17 @@ class MainWindow:
     def _preview_image(self, url: str):
         """预览图片"""
         if url:
-            import webbrowser
             webbrowser.open(url)
     
     def _download_image(self, result: Dict):
         """下载图片"""
-        # 这里可以实现图片下载功能
         messagebox.showinfo("提示", "下载功能将在后续版本中实现")
     
     def _update_status(self):
         """更新状态栏"""
-        success_count = len([r for r in self.results if r.get('imageUrl')])
-        total_count = len(self.results)
-        fail_count = total_count - success_count
-        
+        total = len(self.results)
         self.status_label.configure(
-            text=f"🟢 状态: 就绪 | ✅ 成功: {success_count} | ❌ 失败: {fail_count} | 📊 总计: {total_count}"
+            text=f"🟢 就绪 | 成功: {self.success_count} | 失败: {self.fail_count} | 总计: {total}"
         )
     
     def run(self):

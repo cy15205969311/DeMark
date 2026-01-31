@@ -341,11 +341,12 @@ class BrowserService:
     
     async def extract_images_from_page(self, url: str, headless: bool = True) -> list:
         """
-        从页面提取图片元素
+        从页面提取图片元素 - 增强版 (支持背景图提取)
+        专门处理 SPA 应用的背景图和 Canvas 渲染图片
         """
         driver = None
         try:
-            logging.info(f"🖼️ 从页面提取图片: {url}")
+            logging.info(f"🖼️ 从页面提取图片 (增强版): {url}")
             
             # 获取驱动
             driver = self._get_stealth_driver(headless=headless)
@@ -354,39 +355,175 @@ class BrowserService:
             driver.get(url)
             
             # 等待页面加载
-            time.sleep(3)
+            time.sleep(5)  # 增加等待时间，确保 SPA 完全加载
             
             # 模拟滚动触发懒加载
             driver.execute_script("window.scrollBy(0, window.innerHeight);")
             time.sleep(2)
+            driver.execute_script("window.scrollBy(0, -window.innerHeight);")
+            time.sleep(1)
             
-            # 查找图片元素
-            from selenium.webdriver.common.by import By
-            images = driver.find_elements(By.TAG_NAME, "img")
+            # 执行增强的图片提取脚本
+            image_data = driver.execute_script("""
+                var result = {
+                    images: [],
+                    backgroundImages: [],
+                    canvasImages: [],
+                    allImages: []
+                };
+                
+                // 1. 提取传统 <img> 标签
+                try {
+                    var images = document.querySelectorAll('img');
+                    images.forEach(function(img) {
+                        var src = img.src || img.getAttribute('data-src') || img.getAttribute('data-original');
+                        if (src && src.startsWith('http')) {
+                            var imgData = {
+                                src: src,
+                                width: img.naturalWidth || img.width || 0,
+                                height: img.naturalHeight || img.height || 0,
+                                alt: img.alt || '',
+                                className: img.className || '',
+                                type: 'img'
+                            };
+                            imgData.size = imgData.width * imgData.height;
+                            result.images.push(imgData);
+                            result.allImages.push(imgData);
+                        }
+                    });
+                } catch(e) {
+                    console.log('Error extracting img tags:', e);
+                }
+                
+                // 2. 提取背景图片 - 核心增强功能
+                try {
+                    var allElements = document.querySelectorAll('*');
+                    allElements.forEach(function(el) {
+                        try {
+                            var computedStyle = window.getComputedStyle(el);
+                            var backgroundImage = computedStyle.backgroundImage;
+                            
+                            if (backgroundImage && backgroundImage !== 'none' && backgroundImage.includes('url(')) {
+                                // 提取 url("...") 中的链接
+                                var matches = backgroundImage.match(/url\\(['"]?([^'"\\)]+)['"]?\\)/g);
+                                if (matches) {
+                                    matches.forEach(function(match) {
+                                        var urlMatch = match.match(/url\\(['"]?([^'"\\)]+)['"]?\\)/);
+                                        if (urlMatch && urlMatch[1]) {
+                                            var bgUrl = urlMatch[1];
+                                            
+                                            // 过滤掉小图标和非 HTTP 链接
+                                            if (bgUrl.startsWith('http') && 
+                                                !bgUrl.includes('favicon') && 
+                                                !bgUrl.includes('icon') &&
+                                                !bgUrl.includes('sprite') &&
+                                                !bgUrl.includes('cursor') &&
+                                                (bgUrl.includes('.jpg') || bgUrl.includes('.png') || 
+                                                 bgUrl.includes('.webp') || bgUrl.includes('.jpeg'))) {
+                                                
+                                                var bgData = {
+                                                    src: bgUrl,
+                                                    width: el.offsetWidth || 0,
+                                                    height: el.offsetHeight || 0,
+                                                    className: el.className || '',
+                                                    tagName: el.tagName || '',
+                                                    type: 'background'
+                                                };
+                                                bgData.size = bgData.width * bgData.height;
+                                                result.backgroundImages.push(bgData);
+                                                result.allImages.push(bgData);
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        } catch(e) {
+                            // 忽略单个元素的错误
+                        }
+                    });
+                } catch(e) {
+                    console.log('Error extracting background images:', e);
+                }
+                
+                // 3. 提取 Canvas 元素 (如果有的话)
+                try {
+                    var canvases = document.querySelectorAll('canvas');
+                    canvases.forEach(function(canvas) {
+                        try {
+                            if (canvas.width > 100 && canvas.height > 100) {
+                                // 尝试将 Canvas 转换为 Data URL
+                                var dataUrl = canvas.toDataURL('image/png');
+                                if (dataUrl && dataUrl.startsWith('data:image')) {
+                                    var canvasData = {
+                                        src: dataUrl,
+                                        width: canvas.width,
+                                        height: canvas.height,
+                                        className: canvas.className || '',
+                                        type: 'canvas'
+                                    };
+                                    canvasData.size = canvasData.width * canvasData.height;
+                                    result.canvasImages.push(canvasData);
+                                    result.allImages.push(canvasData);
+                                }
+                            }
+                        } catch(e) {
+                            // Canvas 可能有跨域限制，忽略错误
+                        }
+                    });
+                } catch(e) {
+                    console.log('Error extracting canvas images:', e);
+                }
+                
+                // 4. 查找可能的图片容器元素
+                try {
+                    var containers = document.querySelectorAll('[class*="image"], [class*="photo"], [class*="picture"], [class*="preview"], [class*="thumbnail"]');
+                    containers.forEach(function(container) {
+                        try {
+                            var computedStyle = window.getComputedStyle(container);
+                            var backgroundImage = computedStyle.backgroundImage;
+                            
+                            if (backgroundImage && backgroundImage !== 'none' && backgroundImage.includes('url(')) {
+                                var urlMatch = backgroundImage.match(/url\\(['"]?([^'"\\)]+)['"]?\\)/);
+                                if (urlMatch && urlMatch[1]) {
+                                    var containerUrl = urlMatch[1];
+                                    if (containerUrl.startsWith('http')) {
+                                        var containerData = {
+                                            src: containerUrl,
+                                            width: container.offsetWidth || 0,
+                                            height: container.offsetHeight || 0,
+                                            className: container.className || '',
+                                            type: 'container_background'
+                                        };
+                                        containerData.size = containerData.width * containerData.height;
+                                        result.backgroundImages.push(containerData);
+                                        result.allImages.push(containerData);
+                                    }
+                                }
+                            }
+                        } catch(e) {
+                            // 忽略单个容器的错误
+                        }
+                    });
+                } catch(e) {
+                    console.log('Error extracting container images:', e);
+                }
+                
+                return result;
+            """)
             
-            image_data = []
-            for img in images:
-                try:
-                    src = img.get_attribute("src") or img.get_attribute("data-src")
-                    if src and src.startswith('http'):
-                        # 获取图片尺寸
-                        width = img.size.get('width', 0)
-                        height = img.size.get('height', 0)
-                        
-                        image_data.append({
-                            'src': src,
-                            'width': width,
-                            'height': height,
-                            'size': width * height
-                        })
-                except Exception:
-                    continue
+            # 处理提取结果
+            all_images = image_data.get('allImages', [])
             
-            logging.info(f"✅ 提取到 {len(image_data)} 个图片元素")
-            return image_data
+            logging.info(f"✅ 图片提取完成:")
+            logging.info(f"   传统 <img> 标签: {len(image_data.get('images', []))} 个")
+            logging.info(f"   背景图片: {len(image_data.get('backgroundImages', []))} 个")
+            logging.info(f"   Canvas 图片: {len(image_data.get('canvasImages', []))} 个")
+            logging.info(f"   总计: {len(all_images)} 个")
+            
+            return all_images
             
         except Exception as e:
-            logging.error(f"❌ 图片提取失败: {e}")
+            logging.error(f"❌ 增强图片提取失败: {e}")
             return []
         finally:
             if driver:
@@ -427,6 +564,100 @@ class BrowserService:
         
         return result
     
+    async def extract_meta_images(self, url: str, headless: bool = True) -> dict:
+        """
+        提取页面中的 Meta 标签图片 - 专门用于 Canva 等平台
+        增强 og:image 和 twitter:image 的提取能力
+        """
+        driver = None
+        try:
+            logging.info(f"🔍 提取Meta标签图片: {url}")
+            
+            # 获取驱动
+            driver = self._get_stealth_driver(headless=headless)
+            
+            # 访问页面
+            driver.get(url)
+            
+            # 等待页面加载
+            time.sleep(3)
+            
+            # 执行JavaScript提取Meta标签
+            meta_data = driver.execute_script("""
+                var result = {
+                    ogImage: null,
+                    twitterImage: null,
+                    otherMetaImages: [],
+                    allImages: []
+                };
+                
+                // 1. 提取 og:image
+                var ogImageMeta = document.querySelector('meta[property="og:image"]');
+                if (ogImageMeta && ogImageMeta.content) {
+                    result.ogImage = ogImageMeta.content;
+                }
+                
+                // 2. 提取 twitter:image
+                var twitterImageMeta = document.querySelector('meta[name="twitter:image"]');
+                if (twitterImageMeta && twitterImageMeta.content) {
+                    result.twitterImage = twitterImageMeta.content;
+                }
+                
+                // 3. 提取其他可能的Meta图片标签
+                var otherMetaSelectors = [
+                    'meta[property="og:image:url"]',
+                    'meta[name="twitter:image:src"]',
+                    'meta[property="image"]',
+                    'meta[name="image"]',
+                    'meta[property="og:image:secure_url"]'
+                ];
+                
+                otherMetaSelectors.forEach(function(selector) {
+                    var meta = document.querySelector(selector);
+                    if (meta && meta.content) {
+                        result.otherMetaImages.push({
+                            selector: selector,
+                            content: meta.content
+                        });
+                    }
+                });
+                
+                // 4. 提取所有图片URL作为备用
+                var images = document.querySelectorAll('img[src], img[data-src]');
+                images.forEach(function(img) {
+                    var src = img.src || img.getAttribute('data-src');
+                    if (src && src.startsWith('http')) {
+                        result.allImages.push({
+                            src: src,
+                            alt: img.alt || '',
+                            width: img.naturalWidth || img.width || 0,
+                            height: img.naturalHeight || img.height || 0
+                        });
+                    }
+                });
+                
+                return result;
+            """)
+            
+            logging.info(f"✅ Meta标签提取完成")
+            logging.info(f"   og:image: {'✅' if meta_data.get('ogImage') else '❌'}")
+            logging.info(f"   twitter:image: {'✅' if meta_data.get('twitterImage') else '❌'}")
+            logging.info(f"   其他Meta图片: {len(meta_data.get('otherMetaImages', []))} 个")
+            logging.info(f"   所有图片: {len(meta_data.get('allImages', []))} 个")
+            
+            return meta_data
+            
+        except Exception as e:
+            logging.error(f"❌ Meta标签提取失败: {e}")
+            return {}
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                    logging.info("✅ Chrome驱动已关闭")
+                except:
+                    pass
+
     async def close(self):
         """关闭浏览器服务"""
         if self.driver:
