@@ -71,10 +71,6 @@ class URLParser:
                 return self._parse_canva_share_url(clean_url, url)
             elif platform == "Chuangkit":
                 return self._parse_chuangkit_share_url(clean_url, url)
-            elif platform == "抖音":
-                return self._parse_douyin_share_url(clean_url, url)
-            elif platform == "小红书":
-                return self._parse_xiaohongshu_share_url(clean_url, url)
             else:
                 # 尝试直接使用原URL
                 return {
@@ -338,10 +334,6 @@ class URLParser:
             return 'Canva'
         elif 'chuangkit.com' in url_lower or 'chuangkit.cn' in url_lower:
             return 'Chuangkit'
-        elif 'douyin.com' in url_lower or 'dy.com' in url_lower:
-            return '抖音'
-        elif 'xiaohongshu.com' in url_lower or 'xhs.com' in url_lower:
-            return '小红书'
         else:
             return 'Unknown'
     
@@ -412,22 +404,3 @@ class URLParser:
             'type': 'direct'
         }
     
-    def _parse_douyin_share_url(self, url: str, original_url: str) -> Dict:
-        """解析抖音分享链接"""
-        return {
-            'success': True,
-            'original_url': original_url,
-            'parsed_url': url,
-            'platform': '抖音',
-            'type': 'direct'
-        }
-    
-    def _parse_xiaohongshu_share_url(self, url: str, original_url: str) -> Dict:
-        """解析小红书分享链接"""
-        return {
-            'success': True,
-            'original_url': original_url,
-            'parsed_url': url,
-            'platform': '小红书',
-            'type': 'direct'
-        }

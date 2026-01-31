@@ -18,6 +18,7 @@ import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.image_extractor import ImageExtractor
+from utils.downloader import ImageDownloader
 
 class MainWindow:
     """
@@ -41,8 +42,10 @@ class MainWindow:
         
         # 初始化组件
         self.extractor = ImageExtractor()
+        self.downloader = ImageDownloader()
         self.results = []
         self.is_extracting = False
+        self.is_downloading = False
         self.success_count = 0
         self.fail_count = 0
         
@@ -145,7 +148,7 @@ class MainWindow:
         # 使用分段按钮替代传统单选按钮
         self.platform_segmented = ctk.CTkSegmentedButton(
             platform_frame,
-            values=["🤖 自动", "🎨 图怪兽", "🎭 Canva", "📐 创客贴", "🎵 抖音", "📱 小红书"],
+            values=["🤖 自动", "🎨 图怪兽", "🎭 Canva", "📐 Chuangkit"],
             font=("Microsoft YaHei UI", 11),
             corner_radius=8,
             border_width=2,
@@ -185,6 +188,34 @@ class MainWindow:
         # 控制按钮
         gallery_controls = ctk.CTkFrame(gallery_header, fg_color="transparent")
         gallery_controls.grid(row=0, column=1, sticky="e")
+        
+        # 批量下载按钮
+        self.download_all_btn = ctk.CTkButton(
+            gallery_controls,
+            text="� 批量下载",
+            command=self._download_all_images,
+            width=100,
+            height=30,
+            corner_radius=6,
+            font=("Microsoft YaHei UI", 10),
+            fg_color="#2d8f2d",
+            hover_color="#1e5f1e"
+        )
+        self.download_all_btn.pack(side="right", padx=(10, 0))
+        
+        # 下载设置按钮
+        self.download_settings_btn = ctk.CTkButton(
+            gallery_controls,
+            text="⚙️ 下载设置",
+            command=self._show_download_settings,
+            width=100,
+            height=30,
+            corner_radius=6,
+            font=("Microsoft YaHei UI", 10),
+            fg_color="#666666",
+            hover_color="#555555"
+        )
+        self.download_settings_btn.pack(side="right", padx=(10, 0))
         
         self.export_btn = ctk.CTkButton(
             gallery_controls,
@@ -443,9 +474,7 @@ class MainWindow:
             "🤖 自动": "auto",
             "🎨 图怪兽": "818ps",
             "🎭 Canva": "Canva",
-            "📐 创客贴": "Chuangkit",
-            "🎵 抖音": "抖音",
-            "📱 小红书": "小红书"
+            "📐 Chuangkit": "Chuangkit"
         }
         platform = platform_map.get(self.platform_segmented.get(), "auto")
         
@@ -726,10 +755,6 @@ class MainWindow:
             return 'Canva'
         elif 'chuangkit.com' in url_lower:
             return 'Chuangkit'
-        elif 'douyin.com' in url_lower or 'dy.com' in url_lower:
-            return '抖音'
-        elif 'xiaohongshu.com' in url_lower or 'xhs.com' in url_lower:
-            return '小红书'
         else:
             return 'Unknown'
     
@@ -796,15 +821,273 @@ class MainWindow:
             webbrowser.open(url)
     
     def _download_image(self, result: Dict):
-        """下载图片"""
-        messagebox.showinfo("提示", "下载功能将在后续版本中实现")
+        """下载单张图片"""
+        if self.is_downloading:
+            messagebox.showwarning("提示", "正在下载中，请稍候...")
+            return
+        
+        image_url = result.get('imageUrl')
+        platform = result.get('platform', 'Unknown')
+        
+        if not image_url:
+            messagebox.showerror("错误", "无效的图片URL")
+            return
+        
+        # 在新线程中执行下载
+        def download_thread():
+            try:
+                # 创建新的事件循环
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self._async_download_single(image_url, platform))
+            finally:
+                loop.close()
+        
+        threading.Thread(target=download_thread, daemon=True).start()
     
-    def _update_status(self):
+    async def _async_download_single(self, image_url: str, platform: str):
+        """异步下载单张图片"""
+        try:
+            self.is_downloading = True
+            self._safe_update_status("📥 开始下载图片...")
+            
+            # 进度回调函数
+            def progress_callback(progress, downloaded, total):
+                if total > 0:
+                    message = f"📥 下载中... {progress:.1f}% ({downloaded}/{total} bytes)"
+                    self._safe_update_status(message)
+            
+            # 执行下载
+            result = await self.downloader.download_image(
+                image_url, 
+                progress_callback=progress_callback,
+                platform=platform
+            )
+            
+            if result['success']:
+                message = f"✅ 下载完成: {result['filename']}"
+                self._safe_update_status(message)
+                # 使用线程安全的消息框
+                self.root.after(0, lambda: messagebox.showinfo("下载完成", f"图片已保存到: {result['file_path']}"))
+            else:
+                error_msg = result.get('error', 'Unknown error')
+                message = f"❌ 下载失败: {error_msg}"
+                self._safe_update_status(message)
+                self.root.after(0, lambda: messagebox.showerror("下载失败", error_msg))
+                
+        except Exception as e:
+            message = f"❌ 下载异常: {e}"
+            self._safe_update_status(message)
+            self.root.after(0, lambda: messagebox.showerror("下载异常", str(e)))
+        finally:
+            self.is_downloading = False
+    
+    def _download_all_images(self):
+        """下载所有成功提取的图片"""
+        if self.is_downloading:
+            messagebox.showwarning("提示", "正在下载中，请稍候...")
+            return
+        
+        # 获取所有成功的结果
+        successful_results = [r for r in self.results if r.get('imageUrl')]
+        
+        if not successful_results:
+            messagebox.showwarning("提示", "没有可下载的图片")
+            return
+        
+        # 确认下载
+        if not messagebox.askyesno("确认下载", f"确定要下载 {len(successful_results)} 张图片吗？"):
+            return
+        
+        # 在新线程中执行批量下载
+        def download_thread():
+            try:
+                # 创建新的事件循环
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self._async_download_batch(successful_results))
+            finally:
+                loop.close()
+        
+        threading.Thread(target=download_thread, daemon=True).start()
+    
+    async def _async_download_batch(self, results: List[Dict]):
+        """异步批量下载图片"""
+        try:
+            self.is_downloading = True
+            message = f"📦 开始批量下载 {len(results)} 张图片..."
+            self._safe_update_status(message)
+            
+            # 提取URL和平台信息
+            download_tasks = []
+            for result in results:
+                image_url = result.get('imageUrl')
+                platform = result.get('platform', 'Unknown')
+                if image_url:
+                    download_tasks.append((image_url, platform))
+            
+            # 进度回调函数
+            def progress_callback(completed, total, result):
+                progress = (completed / total) * 100
+                status = "成功" if result.get('success') else "失败"
+                message = f"📦 批量下载进度: {completed}/{total} ({progress:.1f}%) - 最新: {status}"
+                self._safe_update_status(message)
+            
+            # 执行批量下载
+            image_urls = [task[0] for task in download_tasks]
+            platform = download_tasks[0][1] if download_tasks else "Mixed"
+            
+            batch_result = await self.downloader.batch_download(
+                image_urls,
+                progress_callback=progress_callback,
+                platform=platform,
+                max_concurrent=3
+            )
+            
+            if batch_result['success']:
+                successful = batch_result['successful']
+                failed = batch_result['failed']
+                message = f"✅ 批量下载完成: 成功 {successful}, 失败 {failed}"
+                self._safe_update_status(message)
+                success_msg = f"下载完成！\n成功: {successful} 张\n失败: {failed} 张"
+                self.root.after(0, lambda: messagebox.showinfo("批量下载完成", success_msg))
+            else:
+                error_msg = batch_result.get('error', 'Unknown error')
+                message = f"❌ 批量下载失败: {error_msg}"
+                self._safe_update_status(message)
+                self.root.after(0, lambda: messagebox.showerror("批量下载失败", error_msg))
+                
+        except Exception as e:
+            message = f"❌ 批量下载异常: {e}"
+            self._safe_update_status(message)
+            self.root.after(0, lambda: messagebox.showerror("批量下载异常", str(e)))
+        finally:
+            self.is_downloading = False
+    
+    def _update_status(self, message: str = None):
         """更新状态栏"""
-        total = len(self.results)
-        self.status_label.configure(
-            text=f"🟢 就绪 | 成功: {self.success_count} | 失败: {self.fail_count} | 总计: {total}"
+        if message:
+            # 如果提供了消息，显示消息
+            self.status_label.configure(text=message)
+        else:
+            # 否则显示默认状态
+            total = len(self.results)
+            self.status_label.configure(
+                text=f"🟢 就绪 | 成功: {self.success_count} | 失败: {self.fail_count} | 总计: {total}"
+            )
+    
+    def _safe_update_status(self, message: str):
+        """线程安全的状态更新"""
+        self.root.after(0, lambda: self._update_status(message))
+    
+    def _show_download_settings(self):
+        """显示下载设置对话框"""
+        settings_window = ctk.CTkToplevel(self.root)
+        settings_window.title("下载设置")
+        settings_window.geometry("400x300")
+        settings_window.transient(self.root)
+        settings_window.grab_set()
+        
+        # 居中显示
+        settings_window.geometry("+%d+%d" % (
+            self.root.winfo_rootx() + 50,
+            self.root.winfo_rooty() + 50
+        ))
+        
+        # 下载目录设置
+        dir_frame = ctk.CTkFrame(settings_window)
+        dir_frame.pack(fill="x", padx=20, pady=20)
+        
+        ctk.CTkLabel(dir_frame, text="下载目录:", font=("Microsoft YaHei UI", 12)).pack(anchor="w", padx=10, pady=(10, 5))
+        
+        dir_display_frame = ctk.CTkFrame(dir_frame)
+        dir_display_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        current_dir = str(self.downloader.download_dir)
+        self.dir_label = ctk.CTkLabel(
+            dir_display_frame, 
+            text=current_dir, 
+            font=("Microsoft YaHei UI", 10),
+            anchor="w"
         )
+        self.dir_label.pack(side="left", fill="x", expand=True, padx=10, pady=10)
+        
+        browse_btn = ctk.CTkButton(
+            dir_display_frame,
+            text="浏览",
+            command=lambda: self._browse_download_dir(settings_window),
+            width=60,
+            height=30
+        )
+        browse_btn.pack(side="right", padx=10, pady=10)
+        
+        # 下载统计
+        stats_frame = ctk.CTkFrame(settings_window)
+        stats_frame.pack(fill="x", padx=20, pady=(0, 20))
+        
+        ctk.CTkLabel(stats_frame, text="下载统计:", font=("Microsoft YaHei UI", 12)).pack(anchor="w", padx=10, pady=(10, 5))
+        
+        stats = self.downloader.get_download_stats()
+        stats_text = f"已下载文件: {stats['total_files']} 个\n总大小: {stats['total_size_mb']} MB"
+        
+        ctk.CTkLabel(
+            stats_frame, 
+            text=stats_text, 
+            font=("Microsoft YaHei UI", 10),
+            anchor="w"
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+        
+        # 按钮
+        btn_frame = ctk.CTkFrame(settings_window)
+        btn_frame.pack(fill="x", padx=20, pady=(0, 20))
+        
+        open_dir_btn = ctk.CTkButton(
+            btn_frame,
+            text="打开下载目录",
+            command=lambda: self._open_download_dir(),
+            width=120,
+            height=35
+        )
+        open_dir_btn.pack(side="left", padx=10, pady=10)
+        
+        close_btn = ctk.CTkButton(
+            btn_frame,
+            text="关闭",
+            command=settings_window.destroy,
+            width=80,
+            height=35
+        )
+        close_btn.pack(side="right", padx=10, pady=10)
+    
+    def _browse_download_dir(self, parent_window):
+        """浏览选择下载目录"""
+        new_dir = filedialog.askdirectory(
+            title="选择下载目录",
+            initialdir=str(self.downloader.download_dir)
+        )
+        
+        if new_dir:
+            self.downloader.download_dir = Path(new_dir)
+            self.downloader.download_dir.mkdir(parents=True, exist_ok=True)
+            self.dir_label.configure(text=new_dir)
+            self._safe_update_status(f"📁 下载目录已更改: {new_dir}")
+    
+    def _open_download_dir(self):
+        """打开下载目录"""
+        import subprocess
+        import platform
+        
+        download_path = str(self.downloader.download_dir)
+        
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["explorer", download_path])
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.run(["open", download_path])
+            else:  # Linux
+                subprocess.run(["xdg-open", download_path])
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开目录: {e}")
     
     def run(self):
         """运行主窗口"""

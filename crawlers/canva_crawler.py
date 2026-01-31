@@ -1,6 +1,6 @@
 """
-Canva (可画) 爬虫 - OEmbed 接口优先策略
-专门处理 SPA 单页应用的复杂抓取场景
+Canva (可画) 爬虫 - 简化高效策略
+专门处理 SPA 单页应用，使用智能URL转换 + 快速Meta提取
 """
 import aiohttp
 import asyncio
@@ -20,30 +20,15 @@ from utils.image_validator import ImageValidator
 
 class CanvaCrawler:
     """
-    Canva (可画) 爬虫 - OEmbed 接口优先策略
-    专门处理 SPA 单页应用，使用 OEmbed API + 背景图提取
+    Canva (可画) 爬虫 - 简化高效策略
+    专门处理 SPA 单页应用，使用智能URL转换 + 快速Meta提取
     """
     
     def __init__(self):
         self.validator = ImageValidator()
         
-        # OEmbed API 专用请求头
-        self.api_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Referer': 'https://www.canva.com/',
-            'Origin': 'https://www.canva.com',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin'
-        }
-        
-        # HTML 抓取备用请求头
-        self.html_headers = {
+        # 高效请求头 - 只使用最有效的User-Agent
+        self.headers = {
             'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
@@ -54,8 +39,8 @@ class CanvaCrawler:
     
     async def extract_image(self, url: str, extracted_params: Optional[Dict] = None) -> Optional[Dict]:
         """
-        提取 Canva 图片 - OEmbed 接口优先策略
-        增强版：支持URL转换和更强的反检测
+        提取 Canva 图片 - 多源融合策略
+        智能URL构造 + 深度页面分析 + 增强反检测
         
         Args:
             url: Canva 模板URL
@@ -66,63 +51,47 @@ class CanvaCrawler:
         """
         session = None
         try:
-            logging.info(f"🎨 开始提取Canva图片 (增强反检测模式): {url}")
+            logging.info(f"🎨 开始提取Canva图片 (多源融合策略): {url}")
             
-            # URL预处理：转换编辑链接为查看链接
-            processed_url = self._preprocess_canva_url(url)
-            if processed_url != url:
-                logging.info(f"🔄 URL转换: {url} -> {processed_url}")
-                url = processed_url
-            
-            # 创建会话，强制 IPv4 连接
-            import socket
-            connector = aiohttp.TCPConnector(
-                family=socket.AF_INET,
-                ssl=False,
-                limit=50,
-                limit_per_host=20,
-                ttl_dns_cache=300,
-                use_dns_cache=True
-            )
-            
-            session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30),
-                connector=connector
-            )
-            
-            # 方法1: OEmbed API 优先 (最高成功率)
-            logging.info("� 尝试 OEmbed API 接口...")
-            result = await self._fetch_oembed_data(session, url)
+            # 步骤1: 智能URL构造 - 直接构造预览图片URL
+            logging.info("🔧 智能URL构造...")
+            result = await self._smart_url_construction(url)
             if result:
-                logging.info("✅ OEmbed API 提取成功")
+                logging.info("✅ 智能URL构造成功")
                 return result
             
-            # 方法2: HTML 正则补救
-            logging.info("� OEmbed API 失败，尝试 HTML 正则补救...")
-            result = await self._extract_from_html_regex(session, url)
+            # 创建增强会话，强化反检测
+            session = await self._create_enhanced_session()
+            
+            # 步骤2: 增强Meta标签提取 - 使用多User-Agent策略
+            logging.info("🚀 增强Meta标签提取...")
+            result = await self._enhanced_meta_extraction(session, url)
             if result:
-                logging.info("✅ HTML 正则补救成功")
+                logging.info("✅ 增强Meta提取成功")
                 return result
             
-            # 方法3: 传统 Meta 标签提取 (兜底)
-            logging.info("🔄 正则补救失败，尝试传统 Meta 标签提取...")
-            result = await self._extract_meta_tags(session, url)
+            # 步骤3: 深度HTML分析 - 使用更全面的正则和解析
+            logging.info("🔍 深度HTML分析...")
+            result = await self._deep_html_analysis(session, url)
             if result:
-                logging.info("✅ Meta 标签提取成功")
+                logging.info("✅ 深度HTML分析成功")
                 return result
             
-            # 方法4: 尝试公开分享链接
-            if '/edit' in url:
-                logging.info("🔗 尝试转换为公开分享链接...")
-                share_url = self._convert_to_share_url(url)
-                if share_url != url:
-                    logging.info(f"🔄 分享链接转换: {share_url}")
-                    result = await self._extract_from_html_regex(session, share_url)
-                    if result:
-                        logging.info("✅ 分享链接提取成功")
-                        return result
+            # 步骤4: 智能分享链接变体 - 更多变体组合
+            logging.info("🔗 智能分享链接变体...")
+            result = await self._smart_share_variants(session, url)
+            if result:
+                logging.info("✅ 分享链接变体成功")
+                return result
             
-            logging.warning("❌ 所有 Canva 提取方法都失败了")
+            # 步骤5: 动态内容提取 - 模拟浏览器行为
+            logging.info("🤖 动态内容提取...")
+            result = await self._dynamic_content_extraction(session, url)
+            if result:
+                logging.info("✅ 动态内容提取成功")
+                return result
+            
+            logging.warning("❌ 所有 Canva 多源融合方法都失败了")
             return None
             
         except Exception as error:
@@ -132,9 +101,536 @@ class CanvaCrawler:
             if session:
                 await session.close()
     
-    def _preprocess_canva_url(self, url: str) -> str:
+    async def _smart_url_construction(self, url: str) -> Optional[Dict]:
         """
-        预处理Canva URL，转换编辑链接为更容易访问的格式
+        智能URL构造 - 基于Canva URL规律直接构造预览图片URL
+        """
+        try:
+            logging.info("🔧 开始智能URL构造...")
+            
+            # 提取设计ID
+            import re
+            design_id_match = re.search(r'/design/([^/]+)', url)
+            if not design_id_match:
+                logging.debug("❌ 无法提取设计ID")
+                return None
+            
+            design_id = design_id_match.group(1)
+            logging.info(f"🎯 提取到设计ID: {design_id}")
+            
+            # 构造可能的预览图片URL - 基于Canva CDN规律
+            possible_urls = []
+            
+            # 确定域名
+            if 'canva.cn' in url:
+                domain_variants = ['canva.cn', 'www.canva.cn']
+            else:
+                domain_variants = ['canva.com', 'www.canva.com']
+            
+            # 构造多种可能的图片URL格式
+            for domain in domain_variants:
+                # 主要预览格式
+                possible_urls.extend([
+                    f"https://{domain}/design/{design_id}/0_1/preview.png",
+                    f"https://{domain}/design/{design_id}/0_1/preview.jpg",
+                    f"https://{domain}/design/{design_id}/preview.png",
+                    f"https://{domain}/design/{design_id}/preview.jpg",
+                    f"https://{domain}/design/{design_id}/thumbnail.png",
+                    f"https://{domain}/design/{design_id}/thumbnail.jpg",
+                ])
+                
+                # CDN格式
+                possible_urls.extend([
+                    f"https://marketplace-canva-{domain.split('.')[0]}.s3.amazonaws.com/{design_id}/preview.png",
+                    f"https://marketplace-canva-{domain.split('.')[0]}.s3.amazonaws.com/{design_id}/preview.jpg",
+                    f"https://d2k1ftgv7pobq7.cloudfront.net/{design_id}/preview.png",
+                    f"https://d2k1ftgv7pobq7.cloudfront.net/{design_id}/preview.jpg",
+                ])
+            
+            logging.info(f"🔄 构造了 {len(possible_urls)} 个候选URL")
+            
+            # 并发验证所有URL
+            import asyncio
+            session = None
+            try:
+                session = await self._create_enhanced_session()
+                
+                # 限制并发数，避免过度请求
+                semaphore = asyncio.Semaphore(5)
+                
+                async def validate_url(test_url):
+                    async with semaphore:
+                        return await self._validate_image_with_session(session, test_url)
+                
+                validation_tasks = [validate_url(test_url) for test_url in possible_urls[:10]]  # 只测试前10个
+                results = await asyncio.gather(*validation_tasks, return_exceptions=True)
+                
+                for i, (test_url, is_valid) in enumerate(zip(possible_urls[:10], results)):
+                    if isinstance(is_valid, bool) and is_valid:
+                        logging.info(f"✅ 找到有效的构造URL: {test_url}")
+                        return {
+                            'imageUrl': test_url,
+                            'platform': 'Canva',
+                            'source': 'smart_construction',
+                            'original_url': url,
+                            'method': 'url_construction',
+                            'design_id': design_id
+                        }
+                
+                logging.debug("❌ 所有构造的URL都无效")
+                return None
+                
+            finally:
+                if session:
+                    await session.close()
+                    
+        except Exception as e:
+            logging.debug(f"❌ 智能URL构造失败: {e}")
+            return None
+    
+    async def _create_enhanced_session(self) -> aiohttp.ClientSession:
+        """
+        创建增强会话 - 强化反检测机制
+        """
+        import socket
+        
+        # 增强的连接器配置
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            ssl=False,
+            limit=30,
+            limit_per_host=10,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True
+        )
+        
+        # 增强的请求头 - 模拟真实浏览器
+        enhanced_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        }
+        
+        return aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20),
+            connector=connector,
+            headers=enhanced_headers
+        )
+    
+    async def _enhanced_meta_extraction(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict]:
+        """
+        增强Meta标签提取 - 使用多User-Agent策略
+        """
+        try:
+            logging.info("🚀 开始增强Meta标签提取...")
+            
+            # 智能URL预处理
+            processed_url = self._smart_url_conversion(url)
+            
+            # 多User-Agent策略 - 选择最有效的几个
+            user_agents = [
+                'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+                'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+                'Twitterbot/1.0',
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ]
+            
+            for ua in user_agents:
+                try:
+                    headers = self.headers.copy()
+                    headers['User-Agent'] = ua
+                    
+                    # 添加随机延迟
+                    import random
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    
+                    async with session.get(processed_url, headers=headers) as response:
+                        if response.status == 200:
+                            html_content = await response.text()
+                            logging.info(f"📄 获取HTML内容: {len(html_content)} 字符 (UA: {ua[:30]}...)")
+                            
+                            # 解析Meta标签
+                            result = await self._parse_meta_tags(html_content, processed_url)
+                            if result:
+                                return result
+                        else:
+                            logging.debug(f"❌ 响应失败 ({response.status}): {ua[:30]}...")
+                            
+                except Exception as e:
+                    logging.debug(f"❌ User-Agent失败: {ua[:30]}... - {e}")
+                    continue
+            
+            logging.debug("❌ 增强Meta提取失败")
+            return None
+            
+        except Exception as e:
+            logging.debug(f"❌ 增强Meta提取异常: {e}")
+            return None
+    
+    async def _parse_meta_tags(self, html_content: str, url: str) -> Optional[Dict]:
+        """
+        解析Meta标签 - 增强版
+        """
+        try:
+            soup = BeautifulSoup(html_content, 'lxml')
+            
+            # 扩展的Meta标签选择器
+            meta_selectors = [
+                ('meta[property="og:image"]', 'content'),
+                ('meta[name="twitter:image"]', 'content'),
+                ('meta[property="og:image:url"]', 'content'),
+                ('meta[name="twitter:image:src"]', 'content'),
+                ('link[rel="image_src"]', 'href'),
+                ('meta[property="image"]', 'content'),
+                ('meta[name="image"]', 'content'),
+                ('meta[property="og:image:secure_url"]', 'content'),
+                ('meta[name="thumbnail"]', 'content'),
+                ('link[rel="apple-touch-icon"]', 'href'),
+            ]
+            
+            for selector, attr in meta_selectors:
+                element = soup.select_one(selector)
+                if element and element.get(attr):
+                    image_url = element[attr]
+                    
+                    # URL标准化
+                    image_url = self._normalize_image_url(image_url, url)
+                    
+                    if self._is_valid_canva_image_url(image_url):
+                        logging.info(f"🎯 找到Meta标签图片: {image_url} (来源: {selector})")
+                        
+                        # 验证图片URL
+                        if await self._validate_image_with_session_quick(image_url):
+                            return {
+                                'imageUrl': image_url,
+                                'platform': 'Canva',
+                                'source': 'enhanced_meta',
+                                'original_url': url,
+                                'method': 'enhanced_meta_extraction',
+                                'meta_selector': selector
+                            }
+            
+            return None
+            
+        except Exception as e:
+            logging.debug(f"❌ Meta标签解析失败: {e}")
+            return None
+    
+    def _normalize_image_url(self, image_url: str, base_url: str) -> str:
+        """
+        标准化图片URL
+        """
+        if image_url.startswith('//'):
+            return 'https:' + image_url
+        elif image_url.startswith('/'):
+            parsed_url = urlparse(base_url)
+            return f"{parsed_url.scheme}://{parsed_url.netloc}{image_url}"
+        return image_url
+    
+    async def _validate_image_with_session_quick(self, image_url: str) -> bool:
+        """
+        快速验证图片URL - 独立会话
+        """
+        try:
+            session = await self._create_enhanced_session()
+            try:
+                async with session.head(image_url, timeout=8) as response:
+                    if response.status == 200:
+                        content_length = response.headers.get('Content-Length')
+                        if content_length and int(content_length) > 10240:  # 大于10KB
+                            return True
+                return False
+            finally:
+                await session.close()
+        except:
+            return False
+    
+    async def _deep_html_analysis(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict]:
+        """
+        深度HTML分析 - 使用更全面的正则和解析
+        """
+        try:
+            logging.info("🔍 开始深度HTML分析...")
+            
+            processed_url = self._smart_url_conversion(url)
+            
+            async with session.get(processed_url, headers=self.headers) as response:
+                if response.status != 200:
+                    logging.debug(f"⚠️ 深度分析页面响应异常: {response.status}")
+                    return None
+                
+                html_content = await response.text()
+                logging.info(f"📄 获取深度分析HTML内容: {len(html_content)} 字符")
+            
+            # 深度正则搜索模式 - 更全面的模式
+            deep_patterns = [
+                # JSON数据中的图片字段
+                r'"thumbnail_url"\s*:\s*"(https?:[^"]+)"',
+                r'"preview_url"\s*:\s*"(https?:[^"]+)"',
+                r'"image_url"\s*:\s*"(https?:[^"]+)"',
+                r'"cover_url"\s*:\s*"(https?:[^"]+)"',
+                r'"previewImageUrl"\s*:\s*"(https?:[^"]+)"',
+                r'"thumbnailImageUrl"\s*:\s*"(https?:[^"]+)"',
+                
+                # JavaScript变量
+                r'var\s+\w*[Ii]mage\w*\s*=\s*["\']([^"\']+)["\']',
+                r'const\s+\w*[Ii]mage\w*\s*=\s*["\']([^"\']+)["\']',
+                r'let\s+\w*[Ii]mage\w*\s*=\s*["\']([^"\']+)["\']',
+                
+                # 数据属性
+                r'data-image\s*=\s*["\']([^"\']+)["\']',
+                r'data-preview\s*=\s*["\']([^"\']+)["\']',
+                r'data-thumbnail\s*=\s*["\']([^"\']+)["\']',
+                
+                # CSS背景图片
+                r'background-image\s*:\s*url\(["\']?([^"\']+)["\']?\)',
+                
+                # Canva特定URL模式
+                r'https://[^"\s]*canva[^"\s]*\.(jpg|jpeg|png|webp|gif)',
+                r'https://[^"\s]*\.canva\.[^"\s]*\.(jpg|jpeg|png|webp|gif)',
+                
+                # CDN模式
+                r'https://d[0-9a-z]+\.cloudfront\.net/[^"\s]*\.(jpg|jpeg|png|webp)',
+                r'https://[^"\s]*amazonaws\.com/[^"\s]*canva[^"\s]*\.(jpg|jpeg|png|webp)',
+            ]
+            
+            found_urls = set()
+            
+            for pattern in deep_patterns:
+                try:
+                    matches = re.findall(pattern, html_content, re.IGNORECASE | re.MULTILINE)
+                    for match in matches:
+                        if isinstance(match, tuple):
+                            image_url = match[0]
+                        else:
+                            image_url = match
+                        
+                        # 标准化URL
+                        image_url = self._normalize_image_url(image_url, processed_url)
+                        
+                        if self._is_valid_canva_image_url(image_url):
+                            found_urls.add(image_url)
+                            logging.info(f"🎯 深度分析找到图片URL: {image_url[:80]}...")
+                except Exception as e:
+                    logging.debug(f"❌ 深度模式失败: {pattern[:30]}... - {e}")
+                    continue
+            
+            logging.info(f"📊 深度分析结果: 找到 {len(found_urls)} 个候选URL")
+            
+            # 按优先级排序验证
+            sorted_urls = sorted(found_urls, key=lambda x: self._get_url_priority(x), reverse=True)
+            
+            for i, image_url in enumerate(sorted_urls[:8]):  # 最多验证前8个
+                logging.info(f"🔍 验证深度候选URL {i+1}/{min(len(sorted_urls), 8)}: {image_url[:60]}...")
+                if await self._validate_image_with_session(session, image_url):
+                    logging.info(f"✅ 深度分析验证成功: {image_url}")
+                    return {
+                        'imageUrl': image_url,
+                        'platform': 'Canva',
+                        'source': 'deep_analysis',
+                        'original_url': url,
+                        'method': 'deep_html_analysis',
+                        'total_candidates': len(found_urls)
+                    }
+            
+            logging.debug(f"❌ 深度分析未找到有效图片 (测试了{len(sorted_urls)}个候选)")
+            return None
+            
+        except Exception as e:
+            logging.debug(f"❌ 深度HTML分析失败: {e}")
+            return None
+    
+    async def _smart_share_variants(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict]:
+        """
+        智能分享链接变体 - 更多变体组合
+        """
+        try:
+            logging.info("🔗 开始智能分享链接变体...")
+            
+            import re
+            design_id_match = re.search(r'/design/([^/]+)', url)
+            if not design_id_match:
+                return None
+            
+            design_id = design_id_match.group(1)
+            
+            # 生成更多变体
+            variants = []
+            
+            if 'canva.cn' in url:
+                variants.extend([
+                    f"https://www.canva.cn/design/{design_id}/view",
+                    f"https://www.canva.cn/design/{design_id}",
+                    f"https://canva.cn/design/{design_id}/view",
+                    f"https://canva.cn/design/{design_id}",
+                    f"https://www.canva.cn/design/{design_id}/preview",
+                    f"https://www.canva.cn/templates/{design_id}",
+                ])
+            else:
+                variants.extend([
+                    f"https://www.canva.com/design/{design_id}/view",
+                    f"https://www.canva.com/design/{design_id}",
+                    f"https://canva.com/design/{design_id}/view",
+                    f"https://canva.com/design/{design_id}",
+                    f"https://www.canva.com/design/{design_id}/preview",
+                    f"https://www.canva.com/templates/{design_id}",
+                ])
+            
+            # 测试每个变体
+            for variant_url in variants[:6]:  # 限制测试数量
+                try:
+                    logging.info(f"🔄 测试分享变体: {variant_url}")
+                    
+                    # 添加随机延迟
+                    import random
+                    await asyncio.sleep(random.uniform(0.3, 1.0))
+                    
+                    result = await self._enhanced_meta_extraction(session, variant_url)
+                    if result:
+                        logging.info("✅ 分享变体成功")
+                        return result
+                        
+                except Exception as e:
+                    logging.debug(f"❌ 分享变体失败: {variant_url} - {e}")
+                    continue
+            
+            logging.debug("❌ 所有分享变体都失败了")
+            return None
+            
+        except Exception as e:
+            logging.debug(f"❌ 智能分享变体失败: {e}")
+            return None
+    
+    async def _dynamic_content_extraction(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict]:
+        """
+        动态内容提取 - 模拟浏览器行为
+        """
+        try:
+            logging.info("🤖 开始动态内容提取...")
+            
+            processed_url = self._smart_url_conversion(url)
+            
+            # 模拟浏览器行为的请求头
+            browser_headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Referer': 'https://www.google.com/',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'cross-site',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0'
+            }
+            
+            # 模拟真实用户访问流程
+            async with session.get(processed_url, headers=browser_headers) as response:
+                if response.status != 200:
+                    logging.debug(f"⚠️ 动态内容页面响应异常: {response.status}")
+                    return None
+                
+                html_content = await response.text()
+                logging.info(f"📄 获取动态内容HTML: {len(html_content)} 字符")
+            
+            # 寻找动态加载的图片数据
+            dynamic_patterns = [
+                # React/Vue组件数据
+                r'window\.__INITIAL_STATE__\s*=\s*({[^}]+})',
+                r'window\.__PRELOADED_STATE__\s*=\s*({[^}]+})',
+                r'window\.__DATA__\s*=\s*({[^}]+})',
+                
+                # JSON-LD结构化数据
+                r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>([^<]+)</script>',
+                
+                # 内联JSON数据
+                r'data-react-props\s*=\s*["\']([^"\']+)["\']',
+                r'data-props\s*=\s*["\']([^"\']+)["\']',
+                
+                # API调用URL
+                r'api/[^"\s]*image[^"\s]*',
+                r'api/[^"\s]*preview[^"\s]*',
+                r'api/[^"\s]*thumbnail[^"\s]*',
+            ]
+            
+            for pattern in dynamic_patterns:
+                try:
+                    matches = re.findall(pattern, html_content, re.IGNORECASE | re.DOTALL)
+                    for match in matches:
+                        # 尝试解析JSON数据
+                        if match.startswith('{'):
+                            try:
+                                import json
+                                data = json.loads(match)
+                                image_url = self._extract_image_from_json(data)
+                                if image_url and self._is_valid_canva_image_url(image_url):
+                                    if await self._validate_image_with_session(session, image_url):
+                                        logging.info(f"✅ 动态内容提取成功: {image_url}")
+                                        return {
+                                            'imageUrl': image_url,
+                                            'platform': 'Canva',
+                                            'source': 'dynamic_content',
+                                            'original_url': url,
+                                            'method': 'dynamic_content_extraction'
+                                        }
+                            except:
+                                continue
+                except Exception as e:
+                    logging.debug(f"❌ 动态模式失败: {pattern[:30]}... - {e}")
+                    continue
+            
+            logging.debug("❌ 动态内容提取未找到有效图片")
+            return None
+            
+        except Exception as e:
+            logging.debug(f"❌ 动态内容提取失败: {e}")
+            return None
+    
+    def _extract_image_from_json(self, data: dict) -> Optional[str]:
+        """
+        从JSON数据中提取图片URL
+        """
+        try:
+            # 递归搜索图片URL
+            def search_image_url(obj):
+                if isinstance(obj, dict):
+                    for key, value in obj.items():
+                        if isinstance(key, str) and any(keyword in key.lower() for keyword in ['image', 'preview', 'thumbnail', 'cover']):
+                            if isinstance(value, str) and value.startswith('http'):
+                                return value
+                        result = search_image_url(value)
+                        if result:
+                            return result
+                elif isinstance(obj, list):
+                    for item in obj:
+                        result = search_image_url(item)
+                        if result:
+                            return result
+                return None
+            
+            return search_image_url(data)
+            
+        except Exception as e:
+            logging.debug(f"❌ JSON图片提取失败: {e}")
+            return None
+    
+    def _smart_url_conversion(self, url: str) -> str:
+        """
+        智能URL转换 - 编辑链接转查看链接，提高访问成功率
         """
         try:
             # 移除UTM参数，简化URL
@@ -151,368 +647,8 @@ class CanvaCrawler:
             return base_url
             
         except Exception as e:
-            logging.debug(f"❌ URL预处理失败: {e}")
+            logging.debug(f"❌ URL转换失败: {e}")
             return url
-    
-    def _convert_to_share_url(self, url: str) -> str:
-        """
-        尝试转换为公开分享URL格式
-        """
-        try:
-            import re
-            
-            # 提取设计ID
-            design_id_match = re.search(r'/design/([^/]+)', url)
-            if design_id_match:
-                design_id = design_id_match.group(1)
-                
-                # 构建不同的分享URL格式
-                if 'canva.cn' in url:
-                    return f"https://www.canva.cn/design/{design_id}/view"
-                else:
-                    return f"https://www.canva.com/design/{design_id}/view"
-            
-            return url
-            
-        except Exception as e:
-            logging.debug(f"❌ 分享URL转换失败: {e}")
-            return url
-    
-    async def _fetch_oembed_data(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict]:
-        """
-        获取 OEmbed 数据 - 核心方法
-        注意：Canva 可能没有公开的 OEmbed API，此方法主要用于测试
-        """
-        try:
-            # 确定 OEmbed API 端点
-            oembed_url = self._build_oembed_url(url)
-            logging.info(f"🔗 构建 OEmbed URL: {oembed_url}")
-            
-            # 发送 API 请求
-            async with session.get(oembed_url, headers=self.api_headers) as response:
-                logging.debug(f"🌐 OEmbed API 响应状态: {response.status}")
-                
-                if response.status == 404:
-                    logging.debug("❌ OEmbed API 端点不存在 (404)")
-                    return None
-                elif response.status == 403:
-                    logging.debug("❌ OEmbed API 访问被拒绝 (403)")
-                    return None
-                elif response.status != 200:
-                    logging.debug(f"⚠️ OEmbed API 响应异常: {response.status}")
-                    return None
-                
-                # 检查响应内容类型
-                content_type = response.headers.get('Content-Type', '').lower()
-                if 'application/json' not in content_type:
-                    logging.debug(f"❌ OEmbed API 返回非JSON内容: {content_type}")
-                    return None
-                
-                # 解析 JSON 响应
-                try:
-                    data = await response.json()
-                    logging.info(f"📄 获取 OEmbed 数据: {len(str(data))} 字符")
-                except Exception as e:
-                    logging.debug(f"❌ OEmbed JSON 解析失败: {e}")
-                    return None
-            
-            # 提取 thumbnail_url
-            thumbnail_url = data.get('thumbnail_url')
-            if not thumbnail_url:
-                logging.debug("❌ OEmbed 数据中未找到 thumbnail_url")
-                return None
-            
-            logging.info(f"🎯 找到 OEmbed thumbnail_url: {thumbnail_url}")
-            
-            # 验证图片URL
-            if await self._validate_image_with_session(session, thumbnail_url):
-                logging.info("✅ OEmbed thumbnail_url 验证成功")
-                return {
-                    'imageUrl': thumbnail_url,
-                    'platform': 'Canva',
-                    'source': 'oembed_api',
-                    'original_url': url,
-                    'method': 'oembed_extraction',
-                    'title': data.get('title', ''),
-                    'author_name': data.get('author_name', ''),
-                    'width': data.get('thumbnail_width'),
-                    'height': data.get('thumbnail_height')
-                }
-            else:
-                logging.debug("❌ OEmbed thumbnail_url 验证失败")
-                return None
-                
-        except Exception as e:
-            logging.debug(f"❌ OEmbed 数据获取失败: {e}")
-            return None
-    
-    def _build_oembed_url(self, target_url: str) -> str:
-        """
-        构建 OEmbed API URL
-        """
-        try:
-            parsed = urlparse(target_url)
-            domain = parsed.netloc.lower()
-            
-            # 根据域名选择对应的 OEmbed 端点
-            if 'canva.cn' in domain:
-                oembed_base = 'https://www.canva.cn/_oembed'
-            else:
-                oembed_base = 'https://www.canva.com/_oembed'
-            
-            # 构建完整的 OEmbed URL
-            encoded_url = quote(target_url, safe='')
-            oembed_url = f"{oembed_base}?url={encoded_url}&format=json"
-            
-            return oembed_url
-            
-        except Exception as e:
-            logging.error(f"❌ OEmbed URL 构建失败: {e}")
-            # 默认使用 .com 端点
-            encoded_url = quote(target_url, safe='')
-            return f"https://www.canva.com/_oembed?url={encoded_url}&format=json"
-    
-    async def _extract_from_html_regex(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict]:
-        """
-        HTML 正则补救 - 在源码中搜索图片URL
-        增强版：支持多种User-Agent和更全面的正则模式
-        """
-        try:
-            logging.info("🔍 开始 HTML 正则补救...")
-            
-            # 尝试多种User-Agent策略 - 增强反检测
-            user_agents = [
-                # 搜索引擎爬虫 (通常不被拦截)
-                'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-                'Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm)',
-                'Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)',
-                
-                # 社交媒体爬虫 (通常能获得更好的Meta数据)
-                'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
-                'Twitterbot/1.0',
-                'LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +https://www.linkedin.com/)',
-                'WhatsApp/2.19.81 A',
-                
-                # 移动设备User-Agent (有时限制较少)
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1',
-                'Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36',
-                
-                # 标准浏览器 (最后尝试)
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
-            ]
-            
-            html_content = None
-            successful_ua = None
-            
-            # 尝试不同的User-Agent
-            for ua in user_agents:
-                try:
-                    # 构建更完整的请求头，模拟真实浏览器
-                    headers = {
-                        'User-Agent': ua,
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-                        'Accept-Encoding': 'gzip, deflate, br',
-                        'DNT': '1',
-                        'Connection': 'keep-alive',
-                        'Upgrade-Insecure-Requests': '1',
-                        'Sec-Fetch-Dest': 'document',
-                        'Sec-Fetch-Mode': 'navigate',
-                        'Sec-Fetch-Site': 'none',
-                        'Sec-Fetch-User': '?1',
-                        'Cache-Control': 'max-age=0'
-                    }
-                    
-                    # 为不同类型的User-Agent添加特定头部
-                    if 'Googlebot' in ua or 'Bingbot' in ua or 'YandexBot' in ua:
-                        # 搜索引擎爬虫
-                        headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                        headers.pop('Sec-Fetch-Dest', None)
-                        headers.pop('Sec-Fetch-Mode', None)
-                        headers.pop('Sec-Fetch-Site', None)
-                        headers.pop('Sec-Fetch-User', None)
-                    elif 'facebook' in ua.lower() or 'twitter' in ua.lower() or 'linkedin' in ua.lower():
-                        # 社交媒体爬虫
-                        headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                        headers['Accept-Language'] = 'en-US,en;q=0.5'
-                    elif 'Mobile' in ua or 'iPhone' in ua or 'Android' in ua:
-                        # 移动设备
-                        headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8'
-                        headers['Sec-CH-UA-Mobile'] = '?1'
-                    
-                    # 添加随机延迟，避免被识别为机器人
-                    import random
-                    await asyncio.sleep(random.uniform(0.5, 2.0))
-                    
-                    async with session.get(url, headers=headers) as response:
-                        logging.debug(f"🌐 User-Agent测试: {ua[:30]}... -> {response.status}")
-                        
-                        if response.status == 200:
-                            html_content = await response.text()
-                            successful_ua = ua
-                            logging.info(f"✅ 成功获取HTML ({len(html_content)} 字符) - UA: {ua[:50]}...")
-                            break
-                        elif response.status == 403:
-                            logging.debug(f"❌ 403 Forbidden: {ua[:50]}...")
-                        elif response.status == 429:
-                            logging.debug(f"❌ 429 Too Many Requests: {ua[:50]}...")
-                            # 遇到429时增加延迟
-                            await asyncio.sleep(random.uniform(3.0, 6.0))
-                        else:
-                            logging.debug(f"❌ User-Agent失败 ({response.status}): {ua[:50]}...")
-                except Exception as e:
-                    logging.debug(f"❌ User-Agent异常: {ua[:30]}... - {e}")
-                    continue
-            
-            if not html_content:
-                logging.debug("❌ 所有User-Agent都失败了")
-                return None
-            
-            # 增强的正则搜索模式
-            regex_patterns = [
-                # 主要模式：JSON 中的各种图片字段
-                r'"thumbnail_url"\s*:\s*"(https?:[^"]+)"',
-                r'\"thumbnail_url\"\s*:\s*\"(https?:[^\"]+)\"',
-                r'"thumbnailUrl"\s*:\s*"(https?:[^"]+)"',
-                r'"preview_url"\s*:\s*"(https?:[^"]+)"',
-                r'"previewUrl"\s*:\s*"(https?:[^"]+)"',
-                r'"image_url"\s*:\s*"(https?:[^"]+)"',
-                r'"imageUrl"\s*:\s*"(https?:[^"]+)"',
-                r'"cover_url"\s*:\s*"(https?:[^"]+)"',
-                r'"coverUrl"\s*:\s*"(https?:[^"]+)"',
-                
-                # Canvas 和设计相关模式
-                r'"previewImageUrl"\s*:\s*"(https?:[^"]+)"',
-                r'"thumbnailImageUrl"\s*:\s*"(https?:[^"]+)"',
-                r'"designPreviewUrl"\s*:\s*"(https?:[^"]+)"',
-                r'"templatePreviewUrl"\s*:\s*"(https?:[^"]+)"',
-                
-                # Meta 标签模式
-                r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-                r'<meta\s+name=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']',
-                r'<meta\s+property=["\']og:image:url["\']\s+content=["\']([^"\']+)["\']',
-                
-                # 通用图片 URL 模式 (更精确)
-                r'https://[^"\s]+\.canva\.com/[^"\s]*\.(jpg|jpeg|png|webp|gif)',
-                r'https://[^"\s]+\.canva\.cn/[^"\s]*\.(jpg|jpeg|png|webp|gif)',
-                
-                # CDN 和媒体服务器模式
-                r'https://[^"\s]*canva[^"\s]*\.(jpg|jpeg|png|webp|gif)',
-                r'https://media\.canva\.com/[^"\s]+',
-                r'https://media\.canva\.cn/[^"\s]+',
-                
-                # 数据URL模式 (base64图片)
-                r'data:image/(jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/=]+',
-                
-                # JavaScript变量中的图片URL
-                r'var\s+\w*[Ii]mage\w*\s*=\s*["\']([^"\']+)["\']',
-                r'const\s+\w*[Ii]mage\w*\s*=\s*["\']([^"\']+)["\']',
-                r'let\s+\w*[Ii]mage\w*\s*=\s*["\']([^"\']+)["\']'
-            ]
-            
-            found_urls = set()
-            
-            for pattern in regex_patterns:
-                try:
-                    matches = re.findall(pattern, html_content, re.IGNORECASE | re.MULTILINE)
-                    for match in matches:
-                        if isinstance(match, tuple):
-                            # 处理带分组的匹配
-                            image_url = match[0]
-                        else:
-                            image_url = match
-                        
-                        if self._is_valid_canva_image_url(image_url):
-                            found_urls.add(image_url)
-                            logging.info(f"🎯 正则找到图片URL: {image_url[:80]}...")
-                except Exception as e:
-                    logging.debug(f"❌ 正则模式失败: {pattern[:30]}... - {e}")
-                    continue
-            
-            logging.info(f"📊 正则搜索结果: 找到 {len(found_urls)} 个候选URL")
-            
-            # 按优先级排序验证找到的 URL
-            sorted_urls = sorted(found_urls, key=lambda x: self._get_url_priority(x), reverse=True)
-            
-            for i, image_url in enumerate(sorted_urls[:10]):  # 最多验证前10个
-                logging.info(f"🔍 验证候选URL {i+1}/{min(len(sorted_urls), 10)}: {image_url[:60]}...")
-                if await self._validate_image_with_session(session, image_url):
-                    logging.info(f"✅ 正则提取验证成功: {image_url}")
-                    return {
-                        'imageUrl': image_url,
-                        'platform': 'Canva',
-                        'source': 'html_regex',
-                        'original_url': url,
-                        'method': 'regex_extraction',
-                        'successful_user_agent': successful_ua,
-                        'total_candidates': len(found_urls)
-                    }
-            
-            logging.debug(f"❌ 正则补救未找到有效图片 (测试了{len(sorted_urls)}个候选)")
-            return None
-            
-        except Exception as e:
-            logging.debug(f"❌ HTML 正则补救失败: {e}")
-            return None
-    
-    async def _extract_meta_tags(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict]:
-        """
-        传统 Meta 标签提取 - 兜底方案
-        """
-        try:
-            logging.info("� 开始传统 Meta 标签提取...")
-            
-            # 获取页面 HTML
-            async with session.get(url, headers=self.html_headers) as response:
-                if response.status != 200:
-                    logging.debug(f"⚠️ Meta 页面响应异常: {response.status}")
-                    return None
-                
-                html_content = await response.text()
-                logging.info(f"📄 获取 Meta HTML 内容: {len(html_content)} 字符")
-            
-            # 使用 BeautifulSoup 解析
-            soup = BeautifulSoup(html_content, 'lxml')
-            
-            # Meta 标签提取优先级
-            meta_selectors = [
-                ('meta[property="og:image"]', 'content'),
-                ('meta[name="twitter:image"]', 'content'),
-                ('link[rel="image_src"]', 'href'),
-                ('meta[property="og:image:url"]', 'content'),
-                ('meta[name="twitter:image:src"]', 'content'),
-                ('meta[property="image"]', 'content'),
-                ('meta[name="image"]', 'content')
-            ]
-            
-            for selector, attr in meta_selectors:
-                element = soup.select_one(selector)
-                if element and element.get(attr):
-                    image_url = element[attr]
-                    logging.info(f"🎯 找到 Meta 标签图片: {image_url} (来源: {selector})")
-                    
-                    # 验证图片URL
-                    if await self._validate_image_with_session(session, image_url):
-                        logging.info(f"✅ Meta 标签验证成功: {image_url}")
-                        return {
-                            'imageUrl': image_url,
-                            'platform': 'Canva',
-                            'source': 'meta_tag',
-                            'original_url': url,
-                            'method': 'meta_extraction',
-                            'meta_selector': selector
-                        }
-            
-            logging.debug("❌ Meta 标签提取未找到有效图片")
-            return None
-            
-        except Exception as e:
-            logging.debug(f"❌ Meta 标签提取失败: {e}")
-            return None
-    
-    def _get_url_priority(self, image_url: str) -> int:
         """
         获取图片URL的优先级分数 (分数越高优先级越高)
         """

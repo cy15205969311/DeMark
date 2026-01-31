@@ -294,10 +294,6 @@ class ImageExtractor:
                 return await self._extract_canva(url, parsed_params)
             elif platform == 'Chuangkit':
                 return await self._extract_chuangkit(url, parsed_params)
-            elif platform == '抖音':
-                return await self._extract_douyin(url, parsed_params)
-            elif platform == '小红书':
-                return await self._extract_xiaohongshu(url, parsed_params)
             else:
                 logging.warning(f"⚠️ 不支持的平台: {platform}")
                 return None
@@ -458,14 +454,6 @@ class ImageExtractor:
         except Exception as e:
             logging.error(f"❌ 创客贴提取失败: {e}")
             return None
-    
-    async def _extract_douyin(self, url: str, parsed_params: dict = None) -> Optional[Dict]:
-        """提取抖音图片 - 基础实现"""
-        return None
-    
-    async def _extract_xiaohongshu(self, url: str, parsed_params: dict = None) -> Optional[Dict]:
-        """提取小红书图片 - 基础实现"""
-        return None
     
     async def close(self):
         """关闭资源"""
