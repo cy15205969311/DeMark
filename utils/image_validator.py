@@ -7,7 +7,9 @@ import asyncio
 import logging
 import re
 import socket
+import threading
 import requests
+import urllib3
 from typing import Optional, Dict
 from urllib.parse import urlparse
 
@@ -39,17 +41,26 @@ class ImageValidator:
     def __init__(self):
         self.session = None
         self.sync_session = None
-        self.sync_fallback_semaphore = asyncio.Semaphore(self.SYNC_FALLBACK_CONCURRENCY)
+        self.sync_fallback_semaphore = threading.BoundedSemaphore(self.SYNC_FALLBACK_CONCURRENCY)
         
-        # 初始化同步会话（回退机制）
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        self._init_sync_session()
+
+    def _init_sync_session(self):
+        """初始化同步会话"""
         self.sync_session = requests.Session()
         self.sync_session.headers.update(self.DEFAULT_HEADERS)
         self.sync_session.verify = False  # 忽略SSL证书验证
-        # 快速熔断
         self.sync_session.timeout = self.SYNC_TIMEOUT
     
     async def _init_async_session(self):
         """初始化异步会话 - 强制IPv4 + 快速熔断"""
+        if self.session and not self.session.closed:
+            return
+
+        if self.session and self.session.closed:
+            self.session = None
+
         if not self.session:
             try:
                 # 强制IPv4连接器 - 解决IPv6解析问题
@@ -94,6 +105,8 @@ class ImageValidator:
                 return async_result
             
             # 方法2: 同步验证 (回退) - 快速模式
+            if not self.sync_session:
+                self._init_sync_session()
             logging.info("🔄 异步验证失败，快速同步验证...")
             sync_result = await self._validate_sync_fast_async(image_url, headers)
             return sync_result
@@ -239,8 +252,14 @@ class ImageValidator:
         """
         在线程池中执行同步回退，避免阻塞事件循环
         """
-        async with self.sync_fallback_semaphore:
-            return await asyncio.to_thread(self._validate_sync_fast, image_url, headers)
+        return await asyncio.to_thread(self._validate_sync_fast_with_limit, image_url, headers)
+
+    def _validate_sync_fast_with_limit(self, image_url: str, headers: dict) -> bool:
+        """
+        用线程级信号量限制同步回退并发
+        """
+        with self.sync_fallback_semaphore:
+            return self._validate_sync_fast(image_url, headers)
     
     def _validate_sync_fast(self, image_url: str, headers: dict) -> bool:
         """
@@ -303,9 +322,11 @@ class ImageValidator:
             if self.session:
                 await self.session.close()
                 logging.info("✅ 异步会话已关闭")
+                self.session = None
             
             if self.sync_session:
                 self.sync_session.close()
                 logging.info("✅ 同步会话已关闭")
+                self.sync_session = None
         except Exception as e:
             logging.warning(f"⚠️ 会话关闭异常: {e}")

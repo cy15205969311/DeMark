@@ -33,6 +33,42 @@ class ImageExtractor:
             'Canva': CanvaCrawler(),
             'Chuangkit': ChuangkitCrawler()
         }
+
+    def _normalize_result_images(self, result: Optional[Dict]) -> Optional[Dict]:
+        """Unify single-image and multi-image results into one structure."""
+        if not result or result.get('status') == 'manual_guidance':
+            return result
+
+        normalized_result = dict(result)
+        image_urls: List[str] = []
+        seen = set()
+
+        for image_url in normalized_result.get('imageUrls', []) or []:
+            if isinstance(image_url, str) and image_url and image_url not in seen:
+                image_urls.append(image_url)
+                seen.add(image_url)
+
+        primary_url = normalized_result.get('imageUrl')
+        if isinstance(primary_url, str) and primary_url and primary_url not in seen:
+            image_urls.insert(0, primary_url)
+            seen.add(primary_url)
+
+        if not image_urls:
+            return normalized_result
+
+        normalized_pages = []
+        for index, image_url in enumerate(image_urls):
+            normalized_pages.append({
+                'page': index + 1,
+                'imageUrl': image_url
+            })
+
+        normalized_result['imageUrl'] = image_urls[0]
+        normalized_result['imageUrls'] = image_urls
+        normalized_result['pages'] = normalized_pages
+        normalized_result['pageCount'] = len(image_urls)
+        normalized_result['isMultiPage'] = len(image_urls) > 1
+        return normalized_result
         
     async def extract_image(self, url: str, platform: str) -> Dict:
         """
@@ -67,13 +103,13 @@ class ImageExtractor:
                 # 验证API返回的图片URL
                 if await self.validator.validate_image_url(api_result['imageUrl']):
                     logging.info("✅ 【成功】第三方API网关返回结果")
-                    return {
+                    return self._normalize_result_images({
                         **api_result,
                         'source': 'api-gateway',
                         'platform': platform,
                         'original_url': url,
                         'processed_url': processed_url
-                    }
+                    })
             
             # ========== 阶段2: 本地平台特定提取 ==========
             logging.info("🔍 阶段2: 尝试本地平台特定提取...")
@@ -92,18 +128,18 @@ class ImageExtractor:
                 # 检查是否是用户指导响应
                 if local_result.get('status') == 'manual_guidance':
                     logging.info("🤝 【用户指导】本地提取返回用户指导")
-                    return {
+                    return self._normalize_result_images({
                         **local_result,
                         'original_url': url,
                         'processed_url': processed_url
-                    }
+                    })
                 elif local_result.get('imageUrl'):
                     logging.info("✅ 【成功】本地提取返回结果")
-                    return {
+                    return self._normalize_result_images({
                         **local_result,
                         'original_url': url,
                         'processed_url': processed_url
-                    }
+                    })
                 
             # ========== 阶段3: Selenium隐身抓取 ==========
             logging.info("🤖 阶段3: 尝试Selenium隐身抓取...")
@@ -114,11 +150,11 @@ class ImageExtractor:
                 
                 if selenium_result and selenium_result.get('imageUrl'):
                     logging.info("✅ 【成功】Selenium隐身抓取成功")
-                    return {
+                    return self._normalize_result_images({
                         **selenium_result,
                         'original_url': url,
                         'processed_url': processed_url
-                    }
+                    })
                     
             except ImportError as e:
                 logging.warning(f"⚠️ Selenium模块未安装: {e}")
@@ -246,8 +282,10 @@ class ImageExtractor:
         
         # 818ps特定规则
         if platform == '818ps' and 'tuguaishou.com' in url_lower:
-            if any(pattern in url_lower for pattern in ['user_preview_ue', 'ips_user_preview_api', 'user_preview']):
+            if any(pattern in url_lower for pattern in ['user_preview_ue', 'user_preview']):
                 score += 400
+            if 'ips_user_preview_api' in url_lower:
+                score -= 320
             if any(pattern in url_lower for pattern in ['designer_upload_asset', 'element', 'asset']):
                 score -= 350
             if url_lower.endswith('.jpg'):
@@ -260,10 +298,10 @@ class ImageExtractor:
     async def _cleanup(self):
         """清理资源"""
         try:
-            if hasattr(self.third_party_api, 'session') and self.third_party_api.session:
-                await self.third_party_api.session.close()
-            if hasattr(self.validator, 'session') and self.validator.session:
-                await self.validator.session.close()
+            if hasattr(self.third_party_api, 'close'):
+                await self.third_party_api.close()
+            if hasattr(self.validator, 'close'):
+                await self.validator.close()
             
             # 清理爬虫资源
             for crawler in self.crawlers.values():

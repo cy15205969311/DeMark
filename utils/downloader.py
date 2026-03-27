@@ -21,6 +21,34 @@ class ImageDownloader:
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.session = None
+
+    async def _ensure_session(self) -> None:
+        """Ensure the aiohttp session is valid for the current event loop."""
+        current_loop = asyncio.get_running_loop()
+
+        if self.session and self.session.closed:
+            self.session = None
+
+        if self.session:
+            session_loop = getattr(self.session, "_loop", None)
+            if session_loop is not current_loop:
+                old_session = self.session
+                self.session = None
+                try:
+                    close_result = old_session.close()
+                    if asyncio.iscoroutine(close_result):
+                        await close_result
+                except Exception as e:
+                    logging.debug(f"跨事件循环关闭旧下载会话失败: {e}")
+                    connector = getattr(old_session, "_connector", None)
+                    if connector:
+                        try:
+                            connector.close()
+                        except Exception:
+                            pass
+
+        if not self.session:
+            self.session = await self._create_session()
         
     async def download_image(
         self, 
@@ -45,8 +73,7 @@ class ImageDownloader:
             logging.info(f"📥 开始下载图片: {image_url}")
             
             # 创建会话
-            if not self.session:
-                self.session = await self._create_session()
+            await self._ensure_session()
             
             # 生成文件名
             if not filename:
@@ -272,8 +299,7 @@ class ImageDownloader:
         try:
             logging.info(f"📦 开始批量下载 {len(image_urls)} 张图片")
             
-            if not self.session:
-                self.session = await self._create_session()
+            await self._ensure_session()
             
             # 限制并发数
             semaphore = asyncio.Semaphore(max_concurrent)

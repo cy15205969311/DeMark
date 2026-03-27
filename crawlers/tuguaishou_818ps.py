@@ -45,6 +45,236 @@ class Tuguaishou818psCrawler:
             'Upgrade-Insecure-Requests': '1'
         }
 
+    async def _ensure_session(self):
+        """确保 aiohttp 会话可用"""
+        if self.session and not self.session.closed:
+            return
+
+        if self.session and self.session.closed:
+            self.session = None
+
+        if not self.session:
+            self.session = aiohttp.ClientSession(
+                headers=self.headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
+
+    def _extract_share_query_params(self, url: str) -> Dict[str, Optional[str]]:
+        """从分享链接中提取常用查询参数。"""
+        parsed_url = urlparse(url)
+        params = parse_qs(parsed_url.query)
+        return {
+            'pic_id': params.get('picId', [None])[0],
+            'upic_id': params.get('upicId', [None])[0],
+            'share_id': params.get('share_id', [None])[0],
+            'share_uid': params.get('share_uid', [None])[0],
+            'save_type': params.get('save_type', [''])[0],
+            'user_source': params.get('user_source', [''])[0],
+        }
+
+    async def _fetch_json(self, url: str, referer: Optional[str] = None) -> Optional[Dict]:
+        """统一发起 JSON 请求。"""
+        await self._ensure_session()
+
+        request_headers = {
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': referer or 'https://ue.818ps.com/',
+            'Origin': 'https://818ps.com',
+        }
+
+        try:
+            async with self.session.get(url, headers=request_headers, timeout=15) as response:
+                if response.status != 200:
+                    logging.warning(f"⚠️ 分享API响应异常 ({response.status}): {url}")
+                    return None
+
+                return await response.json(content_type=None)
+        except Exception as error:
+            logging.warning(f"⚠️ 分享API请求失败: {url} ({error})")
+            return None
+
+    def _extract_expected_page_count_from_share_api_payloads(self, payloads: Dict[str, Dict]) -> int:
+        """根据多个分享 API 响应推断设计稿页数。"""
+        counts: List[int] = []
+
+        share_template = payloads.get('share_template') or {}
+        share_template_data = share_template.get('data') if isinstance(share_template, dict) else None
+        if isinstance(share_template_data, dict):
+            preview_urls = share_template_data.get('preview')
+            if isinstance(preview_urls, list):
+                counts.append(len(preview_urls))
+
+        team_share_payload = payloads.get('team_share_get_templ') or {}
+        if isinstance(team_share_payload, dict):
+            page_map = team_share_payload.get('page_map')
+            if isinstance(page_map, dict):
+                counts.append(len(page_map))
+
+            preview_urls = team_share_payload.get('preview')
+            if isinstance(preview_urls, list):
+                counts.append(len(preview_urls))
+
+            doc = team_share_payload.get('doc')
+            if isinstance(doc, dict):
+                page_attr = doc.get('pageAttr')
+                if isinstance(page_attr, dict):
+                    page_info = page_attr.get('pageInfo')
+                    if isinstance(page_info, list):
+                        counts.append(len(page_info))
+
+        page_data_payload = payloads.get('get_template_page_data') or {}
+        if isinstance(page_data_payload, dict):
+            preview_wrapper = page_data_payload.get('url')
+            if isinstance(preview_wrapper, dict):
+                preview_items = preview_wrapper.get('preview')
+                if isinstance(preview_items, list):
+                    counts.append(len(preview_items))
+
+        counts = [count for count in counts if count > 0]
+        return max(counts, default=0)
+
+    def _normalize_share_preview_group(self, urls: List[str]) -> List[str]:
+        """规范化并过滤分享 API 返回的设计稿预览。"""
+        normalized_urls: List[str] = []
+        seen = set()
+
+        for raw_url in urls:
+            candidate_url = self._normalize_dynamic_candidate_url(raw_url)
+            if not candidate_url or candidate_url in seen:
+                continue
+            if not self._is_design_page_candidate(candidate_url):
+                continue
+
+            normalized_urls.append(candidate_url)
+            seen.add(candidate_url)
+
+        return normalized_urls
+
+    def _extract_share_api_preview_groups(self, payloads: Dict[str, Dict]) -> Tuple[List[Tuple[str, List[str]]], int]:
+        """按优先级抽取分享 API 中的多页设计稿 URL。"""
+        groups: List[Tuple[str, List[str]]] = []
+        expected_page_count = self._extract_expected_page_count_from_share_api_payloads(payloads)
+
+        def add_group(source: str, raw_urls: List[str]) -> None:
+            normalized_urls = self._normalize_share_preview_group(raw_urls)
+            if normalized_urls:
+                groups.append((source, normalized_urls))
+
+        share_template = payloads.get('share_template') or {}
+        share_template_data = share_template.get('data') if isinstance(share_template, dict) else None
+        if isinstance(share_template_data, dict):
+            preview_urls = share_template_data.get('preview')
+            if isinstance(preview_urls, list):
+                add_group('share_template', preview_urls)
+
+        team_share_payload = payloads.get('team_share_get_templ') or {}
+        if isinstance(team_share_payload, dict):
+            preview_urls = team_share_payload.get('preview')
+            if isinstance(preview_urls, list):
+                add_group('team_share_get_templ', preview_urls)
+
+        page_data_payload = payloads.get('get_template_page_data') or {}
+        if isinstance(page_data_payload, dict):
+            preview_wrapper = page_data_payload.get('url')
+            if isinstance(preview_wrapper, dict):
+                preview_items = preview_wrapper.get('preview')
+                if isinstance(preview_items, list):
+                    extracted_urls: List[str] = []
+                    for preview_item in preview_items:
+                        if isinstance(preview_item, dict):
+                            for key in ['origin_img', 'big_img', 'img', 'url', 'preview']:
+                                preview_url = preview_item.get(key)
+                                if isinstance(preview_url, str):
+                                    extracted_urls.append(preview_url)
+                                    break
+                        elif isinstance(preview_item, str):
+                            extracted_urls.append(preview_item)
+                    add_group('get_template_page_data', extracted_urls)
+
+        return groups, expected_page_count
+
+    async def _extract_from_share_api(self, url: str) -> Optional[Dict]:
+        """优先调用 818ps 官方分享 API，直接拿到多页设计稿。"""
+        query_params = self._extract_share_query_params(url)
+        share_id = query_params.get('share_id')
+        upic_id = query_params.get('upic_id')
+        share_uid = query_params.get('share_uid')
+        save_type = query_params.get('save_type') or ''
+        user_source = query_params.get('user_source') or ''
+
+        if not share_id:
+            return None
+
+        payloads: Dict[str, Dict] = {}
+        endpoints = [
+            ('share_template', f'https://818ps.com/apiV1/template/index/share-template?share_id={share_id}'),
+        ]
+
+        if upic_id and share_uid:
+            endpoints.extend([
+                (
+                    'team_share_get_templ',
+                    'https://818ps.com/api/team-share-get-templ'
+                    f'?upicId={upic_id}&share_uid={share_uid}&share_id={share_id}'
+                    f'&save_type={save_type}&user_source={user_source}'
+                ),
+                (
+                    'get_template_page_data',
+                    'https://818ps.com/apiv2/get-template-page-data'
+                    f'?picId=0&upicId={upic_id}&version_id=0&user_template_team_id=0'
+                    f'&paperId=0&share_uid={share_uid}'
+                ),
+                (
+                    'get_template_info',
+                    'https://818ps.com/apiv2/get-template-info'
+                    f'?picId=0&paperId=0&upicId={upic_id}&version_id=0'
+                    f'&user_template_team_id=0&share_uid={share_uid}'
+                ),
+            ])
+
+        for endpoint_name, endpoint_url in endpoints:
+            payload = await self._fetch_json(endpoint_url, referer=url)
+            if isinstance(payload, dict):
+                payloads[endpoint_name] = payload
+
+        preview_groups, expected_page_count = self._extract_share_api_preview_groups(payloads)
+        if not preview_groups:
+            return None
+
+        for source_name, candidate_urls in preview_groups:
+            entries = [
+                {
+                    'url': candidate_url,
+                    'source': f'share_api_{source_name}',
+                    'score': self._score_dynamic_image(candidate_url, f'share_api_{source_name}')
+                }
+                for candidate_url in candidate_urls
+            ]
+            valid_urls = await self._validate_image_entry_urls(entries)
+            if not valid_urls:
+                continue
+
+            enough_pages = expected_page_count <= 1 or len(valid_urls) >= expected_page_count
+            if enough_pages or len(valid_urls) > 1:
+                logging.info(
+                    f"✅ 官方分享API提取成功: source={source_name}, "
+                    f"pages={len(valid_urls)}, expected={expected_page_count or len(valid_urls)}"
+                )
+                return self._build_multi_image_result(
+                    valid_urls,
+                    url,
+                    f'share_api_{source_name}',
+                    max((entry['score'] for entry in entries if entry['url'] in valid_urls), default=0)
+                )
+
+        if expected_page_count > 1:
+            logging.warning(
+                f"⚠️ 官方分享API已拿到候选结果，但有效页数不足: expected={expected_page_count}, "
+                f"groups={[name for name, _ in preview_groups]}"
+            )
+
+        return None
+
     async def _find_first_valid_candidate(self, candidate_urls: List[str]) -> Optional[str]:
         """
         并发验证候选URL，返回最先验证成功的结果
@@ -111,15 +341,12 @@ class Tuguaishou818psCrawler:
             logging.info(f"🎨 开始提取818ps图片: {url}")
             
             # 初始化会话
-            if not self.session:
-                self.session = aiohttp.ClientSession(
-                    headers=self.headers,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                )
+            await self._ensure_session()
             
             # 步骤1: 强制ID优先构建策略 - 关键优化
             upic_id = None
             pic_id = None
+            share_id = None
             
             # 优先使用预提取的参数
             if extracted_params and extracted_params.get('upic_id'):
@@ -128,17 +355,25 @@ class Tuguaishou818psCrawler:
                 logging.info(f"🎯 使用预提取参数: upicId={upic_id}, picId={pic_id}")
             
             # 如果没有预提取参数，从URL中提取
+            query_params = self._extract_share_query_params(url)
+            share_id = query_params.get('share_id')
             if not upic_id:
-                parsed_url = urlparse(url)
-                params = parse_qs(parsed_url.query)
-                pic_id = params.get('picId', [None])[0]
-                upic_id = params.get('upicId', [None])[0]
+                pic_id = query_params.get('pic_id')
+                upic_id = query_params.get('upic_id')
                 if upic_id:
                     logging.info(f"🔍 从URL提取参数: picId={pic_id}, upicId={upic_id}")
             
             # 🆕 智能分流策略：检测用户分享链接，跳过无效的静态URL构建
             is_user_share = (('/u/' in url and ('818ps.com' in url or 'tuguaishou.com' in url)) or 
                            'ue.818ps.com' in url)
+
+            if share_id:
+                logging.info("馃摙 妫€娴嬪埌鍒嗕韩鍙傛暟锛屼紭鍏堝皾璇曞畼鏂瑰垎浜玂PI...")
+                result = await self._extract_from_share_api(url)
+                if result:
+                    logging.info("鉁?瀹樻柟鍒嗕韩API鎻愬彇鎴愬姛锛岃烦杩囧悗缁姩鎬佸洖閫€")
+                    return result
+                logging.warning("鈿狅笍 瀹樻柟鍒嗕韩API鏈懡涓紝缁х画鎵ц鏈湴鍥為€€閾捐矾...")
             
             if is_user_share:
                 if upic_id:
@@ -456,6 +691,7 @@ class Tuguaishou818psCrawler:
         浏览器启动失败时，仍然尝试用静态HTML提取可用信息
         """
         try:
+            await self._ensure_session()
             async with self.session.get(url, timeout=15) as response:
                 if response.status != 200:
                     logging.warning(f"⚠️ 动态页静态抓取失败，响应码: {response.status}")
@@ -489,52 +725,91 @@ class Tuguaishou818psCrawler:
         """
         try:
             logging.info("🔍 分析动态数据...")
-            
-            best_image_url = None
-            best_score = 0
-            
-            # 1. 分析window数据
-            window_data = dynamic_data.get('windowData', {})
-            for key, data in window_data.items():
-                image_url = self._extract_image_from_data(data)
-                if image_url:
-                    score = self._score_dynamic_image(image_url, key)
-                    if score > best_score:
-                        best_image_url = image_url
-                        best_score = score
-                        logging.info(f"🎯 从window.{key}找到图片: {image_url} (评分: {score})")
-            
-            # 2. 分析JSON数据
-            json_data_list = dynamic_data.get('jsonData', [])
-            for i, json_data in enumerate(json_data_list):
-                image_url = self._extract_image_from_data(json_data)
-                if image_url:
-                    score = self._score_dynamic_image(image_url, f'json_{i}')
-                    if score > best_score:
-                        best_image_url = image_url
-                        best_score = score
-                        logging.info(f"🎯 从JSON数据{i}找到图片: {image_url} (评分: {score})")
-            
-            # 3. 分析直接提取的图片URL
-            image_urls = dynamic_data.get('imageUrls', [])
-            for image_url in image_urls:
-                if self._is_relevant_dynamic_image(image_url):
-                    score = self._score_dynamic_image(image_url, 'direct')
-                    if score > best_score:
-                        best_image_url = image_url
-                        best_score = score
-                        logging.info(f"🎯 从直接提取找到图片: {image_url} (评分: {score})")
-            
-            if best_image_url:
-                # 验证最佳图片URL
-                if await self.validator.validate_image_url(best_image_url):
-                    return {
-                        'imageUrl': best_image_url,
-                        'platform': '818ps',
-                        'source': 'dynamic_json_extraction',
-                        'score': best_score,
-                        'original_url': url
-                    }
+
+            detected_page_markers = dynamic_data.get('pageMarkers', []) or []
+            if detected_page_markers:
+                logging.info(f"📑 浏览器识别到页面标记: {detected_page_markers}")
+
+            page_specific_urls = await self._extract_page_specific_image_urls(dynamic_data)
+            if page_specific_urls:
+                logging.info(f"📄 逐页激活提取到设计稿页面: {len(page_specific_urls)}")
+
+            candidate_entries = self._collect_dynamic_image_candidates(dynamic_data)
+            if not candidate_entries:
+                if page_specific_urls:
+                    page_specific_score = max(
+                        [self._score_dynamic_image(image_url, 'page_specific') for image_url in page_specific_urls],
+                        default=0
+                    )
+                    return self._build_multi_image_result(
+                        page_specific_urls,
+                        url,
+                        'dynamic_page_activation',
+                        page_specific_score
+                    )
+                return None
+
+            page_candidates = [
+                entry for entry in candidate_entries
+                if self._is_design_page_candidate(entry['url'])
+            ]
+
+            if page_candidates:
+                valid_page_urls = await self._validate_image_entry_urls(page_candidates)
+                if valid_page_urls:
+                    merged_page_urls: List[str] = []
+                    seen_page_urls = set()
+                    for image_url in page_specific_urls + valid_page_urls:
+                        normalized_url = self._normalize_dynamic_candidate_url(image_url)
+                        if not normalized_url or normalized_url in seen_page_urls:
+                            continue
+                        merged_page_urls.append(normalized_url)
+                        seen_page_urls.add(normalized_url)
+                    logging.info(f"🗂️ 检测到设计稿页面数: {len(valid_page_urls)}")
+                    logging.info(f"page-specific merged design pages: {len(merged_page_urls)}")
+                    if len(detected_page_markers) > len(merged_page_urls):
+                        logging.warning(
+                            f"⚠️ 页面标记数为 {len(detected_page_markers)}，"
+                            f"但当前仅提取到 {len(valid_page_urls)} 张有效设计稿图片"
+                        )
+
+                    page_scores = [
+                        entry['score'] for entry in page_candidates
+                        if entry['url'] in merged_page_urls
+                    ]
+                    page_scores.extend(
+                        self._score_dynamic_image(image_url, 'page_specific')
+                        for image_url in page_specific_urls
+                    )
+                    return self._build_multi_image_result(
+                        merged_page_urls,
+                        url,
+                        'dynamic_page_activation' if page_specific_urls else (
+                            'dynamic_multi_page_extraction' if len(merged_page_urls) > 1 else 'dynamic_json_extraction'
+                        ),
+                        max(page_scores) if page_scores else 0
+                    )
+
+            if page_specific_urls:
+                page_specific_score = max(
+                    [self._score_dynamic_image(image_url, 'page_specific') for image_url in page_specific_urls],
+                    default=0
+                )
+                return self._build_multi_image_result(
+                    page_specific_urls,
+                    url,
+                    'dynamic_page_activation',
+                    page_specific_score
+                )
+
+            best_candidate = max(candidate_entries, key=lambda entry: entry['score'], default=None)
+            if best_candidate and await self.validator.validate_image_url(best_candidate['url']):
+                return self._build_multi_image_result(
+                    [best_candidate['url']],
+                    url,
+                    'dynamic_json_extraction',
+                    best_candidate['score']
+                )
             
             return None
             
@@ -544,112 +819,384 @@ class Tuguaishou818psCrawler:
     
     def _extract_image_from_data(self, data) -> Optional[str]:
         """
-        从数据结构中递归提取图片URL
+        从数据结构中递归提取第一张相关图片URL
         """
         try:
-            if isinstance(data, dict):
-                # 查找常见的图片字段
-                image_fields = [
-                    'imageUrl', 'image_url', 'imgUrl', 'img_url',
-                    'previewUrl', 'preview_url', 'coverUrl', 'cover_url',
-                    'thumbnailUrl', 'thumbnail_url', 'picUrl', 'pic_url',
-                    'workUrl', 'work_url', 'designUrl', 'design_url',
-                    'originalUrl', 'original_url', 'hdUrl', 'hd_url'
-                ]
-                
-                for field in image_fields:
-                    if field in data and isinstance(data[field], str):
-                        url = data[field]
-                        if url.startswith('http') and self._is_relevant_dynamic_image(url):
-                            return url
-                
-                # 递归搜索嵌套对象
-                for value in data.values():
-                    result = self._extract_image_from_data(value)
-                    if result:
-                        return result
-                        
-            elif isinstance(data, list):
-                # 搜索数组中的每个元素
-                for item in data:
-                    result = self._extract_image_from_data(item)
-                    if result:
-                        return result
-            
-            return None
-            
+            image_urls = self._extract_image_urls_from_data(data)
+            return image_urls[0] if image_urls else None
         except Exception:
             return None
-    
+
+    def _extract_image_urls_from_data(self, data) -> List[str]:
+        """
+        从结构化数据中递归提取全部相关图片URL
+        """
+        image_fields = [
+            'imageUrl', 'image_url', 'imgUrl', 'img_url',
+            'previewUrl', 'preview_url', 'coverUrl', 'cover_url',
+            'thumbnailUrl', 'thumbnail_url', 'picUrl', 'pic_url',
+            'workUrl', 'work_url', 'designUrl', 'design_url',
+            'originalUrl', 'original_url', 'hdUrl', 'hd_url',
+            'url', 'src', 'sourceUrl', 'pageUrl'
+        ]
+        image_urls: List[str] = []
+        seen = set()
+
+        def add_candidate(raw_url) -> None:
+            candidate = self._normalize_dynamic_candidate_url(raw_url)
+            if not candidate or candidate in seen:
+                return
+            if not self._is_relevant_dynamic_image(candidate):
+                return
+            seen.add(candidate)
+            image_urls.append(candidate)
+
+        def walk(value) -> None:
+            if isinstance(value, dict):
+                for field in image_fields:
+                    add_candidate(value.get(field))
+                for nested_value in value.values():
+                    walk(nested_value)
+                return
+
+            if isinstance(value, list):
+                for item in value:
+                    walk(item)
+                return
+
+            if not isinstance(value, str):
+                return
+
+            add_candidate(value)
+            for match in re.findall(r'https?://[^"\'\s<>\)]+', value, re.IGNORECASE):
+                add_candidate(match)
+
+        walk(data)
+        return image_urls
+
+    def _normalize_dynamic_candidate_url(self, url: Optional[str]) -> Optional[str]:
+        """
+        规范化动态提取出来的URL
+        """
+        if not isinstance(url, str):
+            return None
+
+        candidate = url.strip().strip('\'"')
+        if not candidate:
+            return None
+
+        candidate = candidate.replace('\\/', '/')
+        if candidate.startswith('//'):
+            candidate = f'https:{candidate}'
+
+        return candidate if candidate.startswith('http') else None
+
+    async def _extract_page_specific_image_urls(self, dynamic_data: dict) -> List[str]:
+        """Resolve per-page preview URLs captured from browser-side page activation."""
+        page_snapshots = dynamic_data.get('pageSnapshots', []) or []
+        if not page_snapshots and dynamic_data.get('pageSpecificImages'):
+            page_snapshots = [
+                {
+                    'page': index + 1,
+                    'previewUrls': [image_url]
+                }
+                for index, image_url in enumerate(dynamic_data.get('pageSpecificImages', []) or [])
+            ]
+
+        if not page_snapshots:
+            return []
+
+        ordered_snapshots = sorted(
+            page_snapshots,
+            key=lambda item: (
+                int(item.get('page') or 0),
+                str(item.get('label') or '')
+            )
+        )
+
+        resolved_urls: List[str] = []
+        seen_urls = set()
+
+        for snapshot in ordered_snapshots:
+            candidate_urls: List[str] = []
+            for key in ['previewUrls', 'newUrls', 'resourceUrls', 'imageUrls']:
+                for raw_url in snapshot.get(key, []) or []:
+                    normalized_url = self._normalize_dynamic_candidate_url(raw_url)
+                    if not normalized_url or normalized_url in candidate_urls:
+                        continue
+                    if not self._is_design_page_candidate(normalized_url):
+                        continue
+                    candidate_urls.append(normalized_url)
+
+            if not candidate_urls:
+                continue
+
+            entries = [
+                {
+                    'url': candidate_url,
+                    'source': 'page_specific',
+                    'score': self._score_dynamic_image(candidate_url, 'page_specific')
+                }
+                for candidate_url in candidate_urls
+            ]
+            entries.sort(key=lambda entry: entry['score'], reverse=True)
+
+            valid_urls = await self._validate_image_entry_urls(entries)
+            if not valid_urls:
+                continue
+
+            chosen_url = valid_urls[0]
+            if chosen_url in seen_urls:
+                continue
+
+            resolved_urls.append(chosen_url)
+            seen_urls.add(chosen_url)
+
+        return resolved_urls
+
+    def _collect_dynamic_image_candidates(self, dynamic_data: dict) -> List[Dict]:
+        """
+        统一收集动态页面中的图片候选
+        """
+        candidates_by_url: Dict[str, Dict] = {}
+
+        def add_candidate(raw_url: Optional[str], source: str) -> None:
+            candidate_url = self._normalize_dynamic_candidate_url(raw_url)
+            if not candidate_url or not self._is_relevant_dynamic_image(candidate_url):
+                return
+
+            score = self._score_dynamic_image(candidate_url, source)
+            existing = candidates_by_url.get(candidate_url)
+            if existing and existing['score'] >= score:
+                return
+
+            candidates_by_url[candidate_url] = {
+                'url': candidate_url,
+                'source': source,
+                'score': score
+            }
+
+        for image_url in dynamic_data.get('imageUrls', []) or []:
+            add_candidate(image_url, 'direct')
+
+        for image_url in dynamic_data.get('resourceUrls', []) or []:
+            add_candidate(image_url, 'resource')
+
+        for image_url in dynamic_data.get('pageSpecificImages', []) or []:
+            add_candidate(image_url, 'page_specific')
+
+        for page_snapshot in dynamic_data.get('pageSnapshots', []) or []:
+            for key, source in [
+                ('previewUrls', 'page_specific'),
+                ('newUrls', 'page_specific'),
+                ('resourceUrls', 'resource'),
+                ('imageUrls', 'page_snapshot')
+            ]:
+                for image_url in page_snapshot.get(key, []) or []:
+                    add_candidate(image_url, source)
+
+        for image_url in self._extract_image_urls_from_content(dynamic_data.get('pageSource', '') or ''):
+            add_candidate(image_url, 'page_source')
+
+        for json_block in dynamic_data.get('jsonData', []) or []:
+            for image_url in self._extract_image_urls_from_data(json_block):
+                add_candidate(image_url, 'json')
+
+        for window_block in (dynamic_data.get('windowData') or {}).values():
+            for image_url in self._extract_image_urls_from_data(window_block):
+                add_candidate(image_url, 'window')
+
+        return list(candidates_by_url.values())
+
+    async def _validate_image_entry_urls(self, entries: List[Dict]) -> List[str]:
+        """
+        并发校验候选URL，按原顺序返回有效结果
+        """
+        if not entries:
+            return []
+
+        results = await asyncio.gather(
+            *(self.validator.validate_image_url(entry['url']) for entry in entries),
+            return_exceptions=True
+        )
+
+        valid_urls: List[str] = []
+        seen = set()
+        for entry, result in zip(entries, results):
+            if result is True and entry['url'] not in seen:
+                valid_urls.append(entry['url'])
+                seen.add(entry['url'])
+
+        return valid_urls
+
+    def _build_multi_image_result(self, image_urls: List[str], original_url: str, source: str, score: int) -> Dict:
+        """
+        构建兼容单页和多页设计稿的统一结果结构
+        """
+        unique_urls: List[str] = []
+        seen = set()
+        for image_url in image_urls:
+            normalized_url = self._normalize_dynamic_candidate_url(image_url)
+            if normalized_url and normalized_url not in seen:
+                unique_urls.append(normalized_url)
+                seen.add(normalized_url)
+
+        return {
+            'imageUrl': unique_urls[0] if unique_urls else None,
+            'imageUrls': unique_urls,
+            'pages': [
+                {
+                    'page': index + 1,
+                    'imageUrl': image_url
+                }
+                for index, image_url in enumerate(unique_urls)
+            ],
+            'pageCount': len(unique_urls),
+            'isMultiPage': len(unique_urls) > 1,
+            'platform': '818ps',
+            'source': source,
+            'score': score,
+            'original_url': original_url
+        }
+
+    def _is_design_page_candidate(self, url: str) -> bool:
+        """
+        判断该URL更像设计稿页而不是编辑器素材
+        """
+        normalized_url = self._normalize_dynamic_candidate_url(url)
+        if not normalized_url or not self._is_relevant_dynamic_image(normalized_url):
+            return False
+
+        url_lower = normalized_url.lower()
+        exclude_keywords = [
+            'editor/', 'crown', 'vip', 'badge', 'icon', 'logo',
+            'material', 'element', 'asset', 'frame', 'mask',
+            'sticker', 'watermark', 'toolbar', 'button',
+            'ips_user_preview_api',
+            'ips_svg/', 'ips_group_word/', 'ips_icon/', 'ips_material/',
+            'group_word/', 'wordart/', 'font/', 'text/', 'emoji/'
+        ]
+        if any(keyword in url_lower for keyword in exclude_keywords):
+            return False
+
+        trusted_domains = [
+            'img.tuguaishou.com',
+            'img.818ps.com',
+            'cdn.818ps.com',
+            'static.818ps.com'
+        ]
+        if not any(domain in url_lower for domain in trusted_domains):
+            return False
+
+        preferred_patterns = [
+            'user_preview_ue',
+            'user_preview',
+            'user_work',
+            '/works/',
+            '/user_work/'
+        ]
+        return any(pattern in url_lower for pattern in preferred_patterns)
+
     def _is_relevant_dynamic_image(self, url: str) -> bool:
         """
-        判断动态提取的图片URL是否相关
+        判断动态提取的图片URL是否与设计稿相关
         """
-        if not url or not url.startswith('http'):
+        normalized_url = self._normalize_dynamic_candidate_url(url)
+        if not normalized_url:
             return False
-        
-        url_lower = url.lower()
-        
-        # 排除明显的无关图片
+
+        url_lower = normalized_url.lower()
         exclude_keywords = [
-            'favicon', 'icon', 'logo', 'avatar', 'sprite',
-            'loading', 'placeholder', 'blank', 'ad', 'banner'
+            'favicon', 'logo', 'avatar', 'sprite', 'loading',
+            'placeholder', 'blank', 'ad', 'banner', 'editor/',
+            'crown', 'vip', 'badge', 'toolbar', 'button',
+            'material', 'element', 'sticker', 'mask', 'frame',
+            'ips_user_preview_api',
+            'ips_svg/', 'ips_group_word/', 'ips_icon/', 'ips_material/',
+            'group_word/', 'wordart/', 'font/', 'text/', 'emoji/'
         ]
-        
-        for keyword in exclude_keywords:
-            if keyword in url_lower:
-                return False
-        
-        # 包含相关关键词
+        if any(keyword in url_lower for keyword in exclude_keywords):
+            return False
+
         include_keywords = [
-            'img.818ps.com', 'cdn.818ps.com', 'tuguaishou.com',
+            'img.818ps.com', 'cdn.818ps.com', 'static.818ps.com',
+            'img.tuguaishou.com', 'tuguaishou.com',
             'pic/', 'work/', 'design/', 'preview/', 'cover/',
-            'user_preview', 'user_work', 'template'
+            'user_preview', 'user_preview_ue', 'user_work',
+            'template', 'auth_key=', '/works/'
         ]
-        
         return any(keyword in url_lower for keyword in include_keywords)
-    
+
     def _score_dynamic_image(self, url: str, source: str) -> int:
         """
         为动态提取的图片URL评分
         """
-        score = 100  # 基础分
+        score = 100
         url_lower = url.lower()
-        
-        # 域名加分
-        if 'img.818ps.com' in url_lower:
-            score += 50
+        path_lower = urlparse(url).path.lower()
+
+        if 'img.tuguaishou.com' in url_lower:
+            score += 80
+        elif 'img.818ps.com' in url_lower:
+            score += 60
         elif 'cdn.818ps.com' in url_lower:
-            score += 40
+            score += 45
+        elif 'static.818ps.com' in url_lower:
+            score += 35
         elif 'tuguaishou.com' in url_lower:
             score += 30
-        
-        # 路径加分
-        if 'user_preview' in url_lower:
-            score += 40
+
+        if 'user_preview_ue' in url_lower:
+            score += 95
+        elif 'ips_user_preview_api' in url_lower:
+            score -= 180
+        elif 'user_preview' in url_lower:
+            score += 75
         elif 'user_work' in url_lower:
-            score += 35
+            score += 50
         elif 'preview' in url_lower:
             score += 30
         elif 'work' in url_lower:
             score += 25
-        
-        # 文件格式加分
-        if url_lower.endswith('.jpg'):
+
+        if 'auth_key=' in url_lower:
+            score += 35
+        if '!l1600' in url_lower or '!l2000' in url_lower or '!l3000' in url_lower:
+            score += 25
+
+        if '.jpg' in path_lower or '.jpeg' in path_lower:
             score += 20
-        elif url_lower.endswith('.png'):
+        elif '.png' in path_lower:
             score += 15
-        elif url_lower.endswith('.webp'):
+        elif '.webp' in path_lower:
             score += 10
-        
-        # 数据源加分
+
         if 'window' in source:
             score += 30
         elif 'json' in source:
             score += 25
+        elif 'share_api' in source:
+            score += 95
+        elif 'page_specific' in source:
+            score += 60
+        elif 'page_snapshot' in source:
+            score += 35
+        elif 'resource' in source:
+            score += 20
         elif 'direct' in source:
             score += 15
-        
+        elif 'page_source' in source:
+            score += 10
+
+        if self._is_design_page_candidate(url):
+            score += 70
+
+        if any(keyword in url_lower for keyword in [
+            'icon', 'thumb', 'small', 'asset', 'element',
+            'ips_svg/', 'ips_group_word/', 'ips_icon/', 'group_word/'
+        ]):
+            score -= 240
+
         return score
     
     async def _extract_json_data(self, html_content: str, url: str) -> Optional[Dict]:
@@ -679,6 +1226,45 @@ class Tuguaishou818psCrawler:
                         
                         if json_str.startswith('{') and json_str.endswith('}'):
                             data = json.loads(json_str)
+                            image_urls = self._extract_image_urls_from_data(data)
+                            if image_urls:
+                                candidate_entries = [
+                                    {
+                                        'url': image_url,
+                                        'source': 'json',
+                                        'score': self._score_dynamic_image(image_url, 'json')
+                                    }
+                                    for image_url in image_urls
+                                ]
+                                page_candidates = [
+                                    entry for entry in candidate_entries
+                                    if self._is_design_page_candidate(entry['url'])
+                                ]
+
+                                if page_candidates:
+                                    valid_page_urls = await self._validate_image_entry_urls(page_candidates)
+                                    if valid_page_urls:
+                                        logging.info(f"🎯 JSON提取找到设计稿页面: {len(valid_page_urls)} 张")
+                                        page_scores = [
+                                            entry['score'] for entry in page_candidates
+                                            if entry['url'] in valid_page_urls
+                                        ]
+                                        return self._build_multi_image_result(
+                                            valid_page_urls,
+                                            url,
+                                            'json_extraction',
+                                            max(page_scores) if page_scores else 0
+                                        )
+
+                                best_candidate = max(candidate_entries, key=lambda entry: entry['score'], default=None)
+                                if best_candidate and await self.validator.validate_image_url(best_candidate['url']):
+                                    logging.info(f"🎯 JSON提取找到图片: {best_candidate['url']}")
+                                    return self._build_multi_image_result(
+                                        [best_candidate['url']],
+                                        url,
+                                        'json_extraction',
+                                        best_candidate['score']
+                                    )
                             
                             # 从JSON数据中提取图片
                             image_url = self._extract_image_from_data(data)
@@ -880,6 +1466,33 @@ class Tuguaishou818psCrawler:
             # 即使没有完整参数，也尝试搜索图片URL
             logging.info("🔍 搜索页面中的图片URL...")
             image_urls = self._extract_image_urls_from_content(html_content)
+            candidate_entries = [
+                {
+                    'url': image_url,
+                    'source': 'page_source',
+                    'score': self._score_dynamic_image(image_url, 'page_source')
+                }
+                for image_url in image_urls
+            ]
+            page_candidates = [
+                entry for entry in candidate_entries
+                if self._is_design_page_candidate(entry['url'])
+            ]
+
+            if page_candidates:
+                valid_page_urls = await self._validate_image_entry_urls(page_candidates)
+                if valid_page_urls:
+                    logging.info(f"🎯 正则回退找到设计稿页面: {len(valid_page_urls)} 张")
+                    page_scores = [
+                        entry['score'] for entry in page_candidates
+                        if entry['url'] in valid_page_urls
+                    ]
+                    return self._build_multi_image_result(
+                        valid_page_urls,
+                        url,
+                        'regex_image_search',
+                        max(page_scores) if page_scores else 0
+                    )
             
             for img_url in image_urls:
                 if await self.validator.validate_image_url(img_url):
@@ -1140,4 +1753,5 @@ class Tuguaishou818psCrawler:
         """关闭资源"""
         if self.session:
             await self.session.close()
+            self.session = None
         await self.validator.close()

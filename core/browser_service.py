@@ -7,7 +7,7 @@ import os
 import sys
 import re
 import subprocess
-from typing import Optional
+from typing import Optional, Dict, List, Any
 import time
 
 class BrowserService:
@@ -78,6 +78,712 @@ class BrowserService:
             return int(version_match.group(1))
 
         return None
+
+    def _dedupe_keep_order(self, items: List[str]) -> List[str]:
+        """Deduplicate strings while preserving discovery order."""
+        seen = set()
+        ordered_items: List[str] = []
+
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            normalized_item = item.strip()
+            if not normalized_item or normalized_item in seen:
+                continue
+            seen.add(normalized_item)
+            ordered_items.append(normalized_item)
+
+        return ordered_items
+
+    def _extract_page_number(self, label: Any) -> Optional[int]:
+        """Extract page numbers from labels such as 第1页."""
+        if not isinstance(label, str):
+            return None
+
+        match = re.search(r'\u7b2c\s*(\d+)\s*\u9875', label)
+        if not match:
+            return None
+
+        return int(match.group(1))
+
+    def _score_preview_candidate(self, candidate: Dict[str, Any], preferred_urls: Optional[set] = None) -> int:
+        """Score preview-like image candidates captured from the browser DOM."""
+        url = str(candidate.get('url') or '').strip()
+        if not url:
+            return -1000
+
+        url_lower = url.lower()
+        blocked_keywords = [
+            'ips_svg/',
+            'ips_group_word/',
+            'ips_icon/',
+            'ips_material/',
+            'ips_user_preview_api',
+            'editor/',
+            'material/',
+            'element/',
+            'asset/',
+            'sticker',
+            'watermark',
+            'toolbar',
+            'button',
+            'crown',
+            'badge',
+            'vip',
+            'icon',
+            'logo',
+        ]
+        if any(keyword in url_lower for keyword in blocked_keywords):
+            return -1000
+
+        score = 0
+        if preferred_urls and url in preferred_urls:
+            score += 220
+
+        if 'user_preview_ue' in url_lower:
+            score += 480
+        elif 'user_preview' in url_lower:
+            score += 380
+        elif 'preview' in url_lower:
+            score += 140
+
+        if 'auth_key=' in url_lower:
+            score += 50
+        if '!l1600' in url_lower or '!l2000' in url_lower or '!l3000' in url_lower:
+            score += 50
+
+        if '.jpg' in url_lower or '.jpeg' in url_lower:
+            score += 35
+        elif '.png' in url_lower:
+            score += 20
+
+        area = int(candidate.get('area') or 0)
+        visible_area = int(candidate.get('visibleArea') or 0)
+        score += min(area // 12000, 90)
+        score += min(visible_area // 6000, 140)
+
+        source = str(candidate.get('source') or '')
+        if source in ['src', 'currentSrc']:
+            score += 30
+        elif 'background' in source:
+            score += 20
+        elif source == 'resource':
+            score += 15
+
+        if candidate.get('isCentered'):
+            score += 25
+        if candidate.get('isLarge'):
+            score += 35
+
+        return score
+
+    def _select_snapshot_preview_urls(
+        self,
+        snapshot: Optional[Dict[str, Any]],
+        preferred_urls: Optional[List[str]] = None,
+        limit: int = 3
+    ) -> List[str]:
+        """Pick the best preview-like URLs from one browser snapshot."""
+        snapshot = snapshot or {}
+        preferred_set = {
+            url.strip()
+            for url in (preferred_urls or [])
+            if isinstance(url, str) and url.strip()
+        }
+        candidates_by_url: Dict[str, Dict[str, Any]] = {}
+
+        def add_candidate(raw_url: Optional[str], **meta: Any) -> None:
+            if not isinstance(raw_url, str):
+                return
+
+            candidate_url = raw_url.strip()
+            if not candidate_url:
+                return
+
+            candidate = {
+                'url': candidate_url,
+                'source': meta.get('source', ''),
+                'area': int(meta.get('area') or 0),
+                'visibleArea': int(meta.get('visibleArea') or 0),
+                'isCentered': bool(meta.get('isCentered')),
+                'isLarge': bool(meta.get('isLarge')),
+            }
+            candidate['score'] = self._score_preview_candidate(candidate, preferred_set)
+            if candidate['score'] <= 0:
+                return
+
+            existing = candidates_by_url.get(candidate_url)
+            if existing and existing['score'] >= candidate['score']:
+                return
+
+            candidates_by_url[candidate_url] = candidate
+
+        for visible_candidate in snapshot.get('visibleCandidates', []) or []:
+            if not isinstance(visible_candidate, dict):
+                continue
+
+            add_candidate(
+                visible_candidate.get('url'),
+                source=visible_candidate.get('source', ''),
+                area=visible_candidate.get('area', 0),
+                visibleArea=visible_candidate.get('visibleArea', 0),
+                isCentered=visible_candidate.get('isCentered', False),
+                isLarge=visible_candidate.get('isLarge', False),
+            )
+
+        for resource_url in snapshot.get('resourceUrls', []) or []:
+            add_candidate(resource_url, source='resource')
+
+        for image_url in snapshot.get('imageUrls', []) or []:
+            add_candidate(image_url, source='imageUrls')
+
+        ordered_candidates = sorted(
+            candidates_by_url.values(),
+            key=lambda item: (
+                -item['score'],
+                -item['visibleArea'],
+                -item['area'],
+                item['url'],
+            )
+        )
+
+        return [item['url'] for item in ordered_candidates[:limit]]
+
+    def _merge_dynamic_capture(self, base: Optional[Dict[str, Any]], snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Merge one browser snapshot into the accumulated dynamic extraction result."""
+        merged: Dict[str, Any] = dict(base or {})
+        snapshot = snapshot or {}
+
+        merged.setdefault('pageSource', '')
+        merged.setdefault('windowData', {})
+        merged.setdefault('jsonData', [])
+        merged.setdefault('apiData', {})
+        merged.setdefault('imageUrls', [])
+        merged.setdefault('resourceUrls', [])
+        merged.setdefault('visibleCandidates', [])
+        merged.setdefault('pageMarkers', [])
+        merged.setdefault('scrollTrace', [])
+        merged.setdefault('pageSnapshots', [])
+        merged.setdefault('pageSpecificImages', [])
+
+        page_source = snapshot.get('pageSource') or ''
+        if len(page_source) >= len(merged.get('pageSource', '')):
+            merged['pageSource'] = page_source
+
+        merged['windowData'].update(snapshot.get('windowData') or {})
+        merged['apiData'].update(snapshot.get('apiData') or {})
+
+        existing_json_keys = {repr(item) for item in merged['jsonData']}
+        for json_item in snapshot.get('jsonData') or []:
+            json_key = repr(json_item)
+            if json_key not in existing_json_keys:
+                merged['jsonData'].append(json_item)
+                existing_json_keys.add(json_key)
+
+        merged['imageUrls'] = self._dedupe_keep_order(
+            merged['imageUrls'] + (snapshot.get('imageUrls') or [])
+        )
+        merged['resourceUrls'] = self._dedupe_keep_order(
+            merged['resourceUrls'] + (snapshot.get('resourceUrls') or [])
+        )
+        merged['pageMarkers'] = self._dedupe_keep_order(
+            merged['pageMarkers'] + (snapshot.get('pageMarkers') or [])
+        )
+
+        visible_candidates_by_url: Dict[str, Dict[str, Any]] = {}
+        for candidate in (merged.get('visibleCandidates') or []) + (snapshot.get('visibleCandidates') or []):
+            if not isinstance(candidate, dict):
+                continue
+
+            candidate_url = str(candidate.get('url') or '').strip()
+            if not candidate_url:
+                continue
+
+            existing = visible_candidates_by_url.get(candidate_url)
+            current_visible_area = int(candidate.get('visibleArea') or 0)
+            current_area = int(candidate.get('area') or 0)
+            if existing:
+                existing_visible_area = int(existing.get('visibleArea') or 0)
+                existing_area = int(existing.get('area') or 0)
+                if (existing_visible_area, existing_area) >= (current_visible_area, current_area):
+                    continue
+
+            visible_candidates_by_url[candidate_url] = candidate
+
+        merged['visibleCandidates'] = list(visible_candidates_by_url.values())
+
+        if snapshot.get('scrollState'):
+            merged['scrollTrace'].append(snapshot['scrollState'])
+
+        return merged
+
+    def _capture_dynamic_snapshot(self, driver) -> Dict[str, Any]:
+        """Capture one DOM snapshot after the current render state settles."""
+        return driver.execute_script("""
+            var result = {
+                pageSource: document.documentElement.outerHTML,
+                windowData: {},
+                jsonData: [],
+                apiData: {},
+                imageUrls: [],
+                resourceUrls: [],
+                visibleCandidates: [],
+                pageMarkers: [],
+                scrollState: null
+            };
+
+            var imageUrlSet = new Set();
+            var resourceUrlSet = new Set();
+            var pageMarkerSet = new Set();
+            var visibleCandidateMap = Object.create(null);
+
+            function normalizeUrl(rawUrl) {
+                if (!rawUrl || typeof rawUrl !== 'string') return null;
+                var candidate = rawUrl.trim().replace(/\\\\\\//g, '/');
+                if (!candidate) return null;
+                if (candidate.startsWith('//')) candidate = 'https:' + candidate;
+                if (!candidate.startsWith('http')) return null;
+                return candidate;
+            }
+
+            function addUrl(rawUrl) {
+                var normalized = normalizeUrl(rawUrl);
+                if (normalized) imageUrlSet.add(normalized);
+            }
+
+            function rememberVisibleCandidate(rawUrl, meta) {
+                var normalized = normalizeUrl(rawUrl);
+                if (!normalized) return;
+
+                imageUrlSet.add(normalized);
+
+                var candidate = {
+                    url: normalized,
+                    source: meta.source || '',
+                    width: Math.round(meta.width || 0),
+                    height: Math.round(meta.height || 0),
+                    area: Math.round(meta.area || 0),
+                    visibleArea: Math.round(meta.visibleArea || 0),
+                    top: Math.round(meta.top || 0),
+                    left: Math.round(meta.left || 0),
+                    centerDistance: Math.round(meta.centerDistance || 0),
+                    isCentered: !!meta.isCentered,
+                    isLarge: !!meta.isLarge,
+                    tagName: meta.tagName || '',
+                    className: meta.className || ''
+                };
+
+                var existing = visibleCandidateMap[normalized];
+                if (!existing || candidate.visibleArea > existing.visibleArea || candidate.area > existing.area) {
+                    visibleCandidateMap[normalized] = candidate;
+                }
+            }
+
+            function addUrlsFromStyle(styleValue) {
+                if (!styleValue || styleValue === 'none') return;
+                var regex = /url\\((['"]?)([^'")]+)\\1\\)/g;
+                var match;
+                while ((match = regex.exec(styleValue)) !== null) {
+                    addUrl(match[2]);
+                }
+            }
+
+            try {
+                if (window.__INITIAL_STATE__) result.windowData.initialState = window.__INITIAL_STATE__;
+                if (window.__APP_DATA__) result.windowData.appData = window.__APP_DATA__;
+                if (window.pageData) result.windowData.pageData = window.pageData;
+                if (window.workData) result.windowData.workData = window.workData;
+                if (window.imageData) result.windowData.imageData = window.imageData;
+            } catch (e) {}
+
+            try {
+                var scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
+                scripts.forEach(function(script) {
+                    try {
+                        var content = script.textContent || script.innerHTML || '';
+                        var trimmed = content.trim();
+                        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+                            result.jsonData.push(JSON.parse(trimmed));
+                        }
+                    } catch (e) {}
+                });
+            } catch (e) {}
+
+            try {
+                performance.getEntriesByType('resource').forEach(function(entry) {
+                    try {
+                        var resourceUrl = normalizeUrl(entry.name);
+                        if (!resourceUrl) return;
+
+                        if (
+                            /\\.(?:png|jpe?g|webp|gif)(?:[?#]|$)/i.test(resourceUrl) ||
+                            /user_preview|preview|auth_key=|ips_user_preview_api/i.test(resourceUrl)
+                        ) {
+                            resourceUrlSet.add(resourceUrl);
+                            imageUrlSet.add(resourceUrl);
+                        }
+                    } catch (e) {}
+                });
+            } catch (e) {}
+
+            try {
+                var elements = document.querySelectorAll('*');
+                elements.forEach(function(el) {
+                    try {
+                        var rect = el.getBoundingClientRect();
+                        var width = Math.max(rect.width || 0, 0);
+                        var height = Math.max(rect.height || 0, 0);
+                        var area = width * height;
+                        var visibleWidth = Math.max(0, Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0));
+                        var visibleHeight = Math.max(0, Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0));
+                        var visibleArea = visibleWidth * visibleHeight;
+                        var centerX = rect.left + (rect.width / 2);
+                        var centerY = rect.top + (rect.height / 2);
+                        var centerDistance = Math.abs(centerX - (window.innerWidth / 2)) + Math.abs(centerY - (window.innerHeight / 2));
+                        var isCentered = centerDistance < Math.max(window.innerWidth, window.innerHeight) * 0.45;
+                        var isLarge = width >= 240 && height >= 240;
+                        var baseMeta = {
+                            width: width,
+                            height: height,
+                            area: area,
+                            visibleArea: visibleArea,
+                            top: rect.top || 0,
+                            left: rect.left || 0,
+                            centerDistance: centerDistance,
+                            isCentered: isCentered,
+                            isLarge: isLarge,
+                            tagName: el.tagName || '',
+                            className: String(el.className || '')
+                        };
+
+                        ['src', 'data-src', 'data-original', 'data-url', 'data-background', 'href', 'poster'].forEach(function(attr) {
+                            var attrValue = el.getAttribute(attr);
+                            addUrl(attrValue);
+                            if (area > 2500 || visibleArea > 2500) {
+                                rememberVisibleCandidate(attrValue, Object.assign({source: attr}, baseMeta));
+                            }
+                        });
+
+                        if (el.src) {
+                            addUrl(el.src);
+                            if (area > 2500 || visibleArea > 2500) {
+                                rememberVisibleCandidate(el.src, Object.assign({source: 'src'}, baseMeta));
+                            }
+                        }
+                        if (el.currentSrc) {
+                            addUrl(el.currentSrc);
+                            if (area > 2500 || visibleArea > 2500) {
+                                rememberVisibleCandidate(el.currentSrc, Object.assign({source: 'currentSrc'}, baseMeta));
+                            }
+                        }
+
+                        var srcset = el.getAttribute('srcset') || '';
+                        if (srcset) {
+                            srcset.split(',').forEach(function(part) {
+                                var srcsetUrl = part.trim().split(/\\s+/)[0];
+                                addUrl(srcsetUrl);
+                                if (area > 2500 || visibleArea > 2500) {
+                                    rememberVisibleCandidate(srcsetUrl, Object.assign({source: 'srcset'}, baseMeta));
+                                }
+                            });
+                        }
+
+                        addUrlsFromStyle(el.getAttribute('style') || '');
+                        var computedStyle = window.getComputedStyle(el);
+                        addUrlsFromStyle(computedStyle.backgroundImage);
+                        addUrlsFromStyle(computedStyle.background);
+                        addUrlsFromStyle(computedStyle.maskImage);
+
+                        [
+                            computedStyle.backgroundImage,
+                            computedStyle.background,
+                            computedStyle.maskImage
+                        ].forEach(function(styleValue) {
+                            if (!styleValue || styleValue === 'none') return;
+
+                            var regex = /url\\((['"]?)([^'")]+)\\1\\)/g;
+                            var match;
+                            while ((match = regex.exec(styleValue)) !== null) {
+                                if (area > 2500 || visibleArea > 2500) {
+                                    rememberVisibleCandidate(match[2], Object.assign({source: 'background'}, baseMeta));
+                                }
+                            }
+                        });
+
+                        var text = (el.innerText || el.textContent || '').trim();
+                        var normalizedPageMatch = text.replace(/\\s+/g, '').match(/^\\u7b2c(\\d+)\\u9875$/);
+                        if (normalizedPageMatch) {
+                            pageMarkerSet.add('\\u7b2c' + normalizedPageMatch[1] + '\\u9875');
+                        }
+                        var pageMatch = text.match(/^第\\s*(\\d+)\\s*页/);
+                        if (pageMatch) {
+                            pageMarkerSet.add('第' + pageMatch[1] + '页');
+                        }
+                    } catch (e) {}
+                });
+            } catch (e) {}
+
+            result.imageUrls = Array.from(imageUrlSet);
+            result.resourceUrls = Array.from(resourceUrlSet);
+            result.visibleCandidates = Object.keys(visibleCandidateMap).map(function(key) {
+                return visibleCandidateMap[key];
+            });
+            result.pageMarkers = Array.from(pageMarkerSet);
+            return result;
+        """)
+
+    def _activate_dynamic_page(self, driver, page_number: int) -> Dict[str, Any]:
+        """Try to click a specific page card in the sidebar like a real user."""
+        return driver.execute_script("""
+            var targetPage = arguments[0];
+            var targetLabel = '\\u7b2c' + targetPage + '\\u9875';
+
+            function normalizeText(value) {
+                return (value || '').replace(/\\s+/g, '').trim();
+            }
+
+            function extractPage(text) {
+                var match = normalizeText(text).match(/^\\u7b2c(\\d+)\\u9875$/);
+                return match ? parseInt(match[1], 10) : null;
+            }
+
+            function isVisible(el) {
+                if (!el) return false;
+                var rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }
+
+            function findClickable(el) {
+                var current = el;
+                var fallback = el;
+                for (var depth = 0; current && depth < 6; depth += 1) {
+                    try {
+                        if (isVisible(current)) fallback = current;
+
+                        var style = window.getComputedStyle(current);
+                        var className = String(current.className || '');
+                        var clickable =
+                            current.tagName === 'BUTTON' ||
+                            current.tagName === 'A' ||
+                            current.getAttribute('role') === 'button' ||
+                            current.tabIndex >= 0 ||
+                            typeof current.onclick === 'function' ||
+                            (style.cursor || '').indexOf('pointer') >= 0 ||
+                            /page|thumb|item|card|preview|cover|list/i.test(className);
+
+                        if (clickable && isVisible(current)) {
+                            return current;
+                        }
+                    } catch (e) {}
+
+                    current = current.parentElement;
+                }
+
+                return fallback;
+            }
+
+            var markers = [];
+            Array.from(document.querySelectorAll('*')).forEach(function(el) {
+                try {
+                    if (!isVisible(el)) return;
+                    var page = extractPage(el.innerText || el.textContent || '');
+                    if (!page) return;
+
+                    markers.push({
+                        page: page,
+                        label: '\\u7b2c' + page + '\\u9875',
+                        el: el
+                    });
+                } catch (e) {}
+            });
+
+            markers.sort(function(a, b) { return a.page - b.page; });
+            var marker = markers.find(function(item) { return item.page === targetPage; });
+            if (!marker) {
+                return {
+                    requestedPage: targetPage,
+                    label: targetLabel,
+                    clicked: false,
+                    reason: 'marker_not_found',
+                    availablePages: markers.map(function(item) { return item.label; })
+                };
+            }
+
+            var target = findClickable(marker.el);
+            try {
+                target.scrollIntoView({block: 'center', inline: 'nearest'});
+            } catch (e) {}
+
+            var rect = target.getBoundingClientRect();
+            var clientX = Math.max(rect.left + Math.min(rect.width / 2, Math.max(rect.width - 8, 1)), 1);
+            var clientY = Math.max(rect.top + Math.min(rect.height / 2, Math.max(rect.height - 8, 1)), 1);
+            var clicked = false;
+
+            function dispatchMouse(el, type) {
+                try {
+                    el.dispatchEvent(new MouseEvent(type, {
+                        view: window,
+                        bubbles: true,
+                        cancelable: true,
+                        clientX: clientX,
+                        clientY: clientY,
+                        buttons: 1
+                    }));
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(type) {
+                if (dispatchMouse(target, type)) {
+                    clicked = true;
+                }
+            });
+
+            try {
+                target.click();
+                clicked = true;
+            } catch (e) {}
+
+            if (marker.el !== target) {
+                try {
+                    marker.el.click();
+                    clicked = true;
+                } catch (e) {}
+            }
+
+            try {
+                var overlay = document.elementFromPoint(clientX, clientY);
+                if (overlay && overlay !== target && overlay !== marker.el) {
+                    overlay.click();
+                    clicked = true;
+                }
+            } catch (e) {}
+
+            try {
+                target.focus({preventScroll: true});
+            } catch (e) {}
+
+            return {
+                requestedPage: targetPage,
+                label: targetLabel,
+                clicked: clicked,
+                reason: clicked ? 'clicked' : 'no_click_effect',
+                targetTag: target.tagName || '',
+                targetClass: String(target.className || ''),
+                availablePages: markers.map(function(item) { return item.label; })
+            };
+        """, page_number)
+
+    def _scroll_dynamic_page(self, driver, round_index: int) -> Dict[str, Any]:
+        """Simulate human scrolling through the editor canvas and lazy-loaded page list."""
+        return driver.execute_script("""
+            var roundIndex = arguments[0] || 0;
+
+            function normalizeText(value) {
+                return (value || '').replace(/\\s+/g, '').trim();
+            }
+
+            function extractPage(text) {
+                var match = normalizeText(text).match(/^\\u7b2c(\\d+)\\u9875$/);
+                return match ? parseInt(match[1], 10) : null;
+            }
+
+            function getPageMarkerElements() {
+                var markers = [];
+                Array.from(document.querySelectorAll('*')).forEach(function(el) {
+                    try {
+                        var page = extractPage(el.innerText || el.textContent || '');
+                        if (page) {
+                            var normalizedRect = el.getBoundingClientRect();
+                            if (normalizedRect.width > 0 && normalizedRect.height > 0) {
+                                markers.push({
+                                    page: page,
+                                    text: '\\u7b2c' + page + '\\u9875',
+                                    el: el
+                                });
+                            }
+                            return;
+                        }
+
+                        var text = (el.innerText || el.textContent || '').trim();
+                        var match = text.match(/^第\\s*(\\d+)\\s*页/);
+                        if (!match) return;
+
+                        var rect = el.getBoundingClientRect();
+                        if (rect.width <= 0 || rect.height <= 0) return;
+
+                        markers.push({
+                            page: parseInt(match[1], 10),
+                            text: '第' + parseInt(match[1], 10) + '页',
+                            el: el
+                        });
+                    } catch (e) {}
+                });
+
+                markers.sort(function(a, b) { return a.page - b.page; });
+                return markers;
+            }
+
+            var pageMarkers = getPageMarkerElements();
+            var focusedPage = null;
+
+            if (pageMarkers.length) {
+                var targetMarker = pageMarkers[Math.min(roundIndex, pageMarkers.length - 1)];
+                try {
+                    targetMarker.el.scrollIntoView({block: 'center', inline: 'nearest'});
+                    focusedPage = targetMarker.page;
+                } catch (e) {}
+            }
+
+            var moved = 0;
+            var candidates = Array.from(document.querySelectorAll('*')).filter(function(el) {
+                try {
+                    var style = window.getComputedStyle(el);
+                    var overflowY = style.overflowY || '';
+                    var rect = el.getBoundingClientRect();
+                    return (
+                        rect.width > 180 &&
+                        rect.height > 180 &&
+                        el.scrollHeight > el.clientHeight + 120 &&
+                        ['auto', 'scroll', 'overlay'].indexOf(overflowY) !== -1
+                    );
+                } catch (e) {
+                    return false;
+                }
+            }).sort(function(a, b) {
+                return (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight);
+            }).slice(0, 8);
+
+            candidates.forEach(function(el) {
+                try {
+                    var before = el.scrollTop;
+                    var step = Math.max(el.clientHeight * 0.85, 260);
+                    el.scrollTop = Math.min(el.scrollTop + step, el.scrollHeight);
+                    if (el.scrollTop > before) moved += 1;
+                } catch (e) {}
+            });
+
+            try {
+                var docEl = document.scrollingElement || document.documentElement || document.body;
+                var beforeDoc = docEl.scrollTop;
+                var docStep = Math.max(window.innerHeight * 0.9, 320);
+                docEl.scrollTop = Math.min(docEl.scrollTop + docStep, docEl.scrollHeight);
+                if (docEl.scrollTop > beforeDoc) moved += 1;
+            } catch (e) {}
+
+            try {
+                window.dispatchEvent(new Event('scroll'));
+            } catch (e) {}
+
+            return {
+                moved: moved,
+                focusedPage: focusedPage,
+                pageMarkers: pageMarkers.map(function(item) { return item.text; }),
+                scrollableContainers: candidates.length
+            };
+        """, round_index)
 
     def _get_windows_file_version(self, chrome_path: str) -> Optional[int]:
         """
@@ -375,75 +1081,106 @@ class BrowserService:
             
             # 等待动态内容加载
             time.sleep(5)  # 增加等待时间
-            
-            # 执行JavaScript获取页面数据
-            page_data = driver.execute_script("""
-                // 尝试获取各种可能的数据源
-                var result = {
-                    pageSource: document.documentElement.outerHTML,
-                    windowData: {},
-                    jsonData: [],
-                    apiData: {},
-                    imageUrls: []
-                };
-                
-                // 1. 获取window对象中的数据
-                try {
-                    if (window.__INITIAL_STATE__) result.windowData.initialState = window.__INITIAL_STATE__;
-                    if (window.__APP_DATA__) result.windowData.appData = window.__APP_DATA__;
-                    if (window.pageData) result.windowData.pageData = window.pageData;
-                    if (window.workData) result.windowData.workData = window.workData;
-                    if (window.imageData) result.windowData.imageData = window.imageData;
-                } catch(e) {}
-                
-                // 2. 查找页面中的JSON数据
-                try {
-                    var scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
-                    scripts.forEach(function(script) {
-                        try {
-                            var content = script.textContent || script.innerHTML;
-                            if (content.trim().startsWith('{') || content.trim().startsWith('[')) {
-                                result.jsonData.push(JSON.parse(content));
-                            }
-                        } catch(e) {}
-                    });
-                } catch(e) {}
-                
-                // 3. 查找所有图片URL
-                try {
-                    var images = document.querySelectorAll('img, [style*="background-image"]');
-                    images.forEach(function(img) {
-                        var src = img.src || img.getAttribute('data-src') || img.getAttribute('data-original');
-                        if (src && src.startsWith('http')) {
-                            result.imageUrls.push(src);
-                        }
-                        
-                        // 检查背景图片
-                        var style = img.style.backgroundImage || getComputedStyle(img).backgroundImage;
-                        if (style && style !== 'none') {
-                            var match = style.match(/url\\(['"]?([^'"\\)]+)['"]?\\)/);
-                            if (match && match[1]) {
-                                result.imageUrls.push(match[1]);
-                            }
-                        }
-                    });
-                } catch(e) {}
-                
-                // 4. 尝试获取API响应数据
-                try {
-                    if (window.fetch) {
-                        // 这里可以添加特定的API调用逻辑
-                    }
-                } catch(e) {}
-                
-                return result;
-            """)
+
+            page_data: Dict[str, Any] = {}
+            page_data = self._merge_dynamic_capture(page_data, self._capture_dynamic_snapshot(driver))
+
+            previous_image_count = len(page_data.get('imageUrls', []))
+            idle_rounds = 0
+
+            for round_index in range(8):
+                scroll_state = self._scroll_dynamic_page(driver, round_index)
+                time.sleep(1.2)
+
+                snapshot = self._capture_dynamic_snapshot(driver)
+                snapshot['scrollState'] = scroll_state
+                page_data = self._merge_dynamic_capture(page_data, snapshot)
+
+                current_image_count = len(page_data.get('imageUrls', []))
+                gained_images = current_image_count - previous_image_count
+                previous_image_count = current_image_count
+
+                logging.info(
+                    f"🔄 动态页滚动采样 #{round_index + 1}: "
+                    f"moved={scroll_state.get('moved', 0)}, "
+                    f"focusedPage={scroll_state.get('focusedPage')}, "
+                    f"markers={len(page_data.get('pageMarkers', []))}, "
+                    f"newImages={gained_images}, totalImages={current_image_count}"
+                )
+
+                if scroll_state.get('moved', 0) <= 0 and gained_images <= 0:
+                    idle_rounds += 1
+                else:
+                    idle_rounds = 0
+
+                if idle_rounds >= 2:
+                    break
+
+            page_snapshots: List[Dict[str, Any]] = []
+            page_specific_images: List[str] = []
+            seen_snapshot_urls = set(
+                self._dedupe_keep_order(
+                    (page_data.get('imageUrls') or []) + (page_data.get('resourceUrls') or [])
+                )
+            )
+            page_targets = [
+                page_number
+                for page_number in (
+                    self._extract_page_number(label)
+                    for label in page_data.get('pageMarkers', [])
+                )
+                if page_number is not None
+            ]
+
+            for page_number in sorted(set(page_targets)):
+                activation_state = self._activate_dynamic_page(driver, page_number)
+                time.sleep(1.2)
+
+                snapshot = self._capture_dynamic_snapshot(driver)
+                snapshot['page'] = page_number
+                snapshot['label'] = f'第{page_number}页'
+                snapshot['activation'] = activation_state
+
+                snapshot_url_pool = self._dedupe_keep_order(
+                    (snapshot.get('imageUrls') or []) + (snapshot.get('resourceUrls') or [])
+                )
+                newly_observed_urls = [
+                    image_url for image_url in snapshot_url_pool
+                    if image_url not in seen_snapshot_urls
+                ]
+                preview_urls = self._select_snapshot_preview_urls(
+                    snapshot,
+                    preferred_urls=newly_observed_urls,
+                    limit=3
+                )
+
+                snapshot['newUrls'] = newly_observed_urls
+                snapshot['previewUrls'] = preview_urls
+
+                page_data = self._merge_dynamic_capture(page_data, snapshot)
+                page_snapshots.append(snapshot)
+                if preview_urls:
+                    page_specific_images.append(preview_urls[0])
+
+                seen_snapshot_urls.update(snapshot_url_pool)
+                logging.info(
+                    f"📄 动态页逐页激活 #{page_number}: "
+                    f"clicked={activation_state.get('clicked')}, "
+                    f"newUrls={len(newly_observed_urls)}, "
+                    f"previewUrls={preview_urls[:2]}"
+                )
+
+            page_data['pageSnapshots'] = page_snapshots
+            page_data['pageSpecificImages'] = self._dedupe_keep_order(page_specific_images)
             
             logging.info(f"✅ 动态内容提取完成")
             logging.info(f"   JSON数据块: {len(page_data.get('jsonData', []))} 个")
             logging.info(f"   图片URL: {len(page_data.get('imageUrls', []))} 个")
             logging.info(f"   Window数据: {len(page_data.get('windowData', {}))} 个属性")
+            logging.info(f"   页面标记: {len(page_data.get('pageMarkers', []))} 个 {page_data.get('pageMarkers', [])}")
             
+            logging.info(f"   resourceUrls: {len(page_data.get('resourceUrls', []))}")
+            logging.info(f"   pageSpecificImages: {page_data.get('pageSpecificImages', [])}")
             return page_data
             
         except Exception as e:

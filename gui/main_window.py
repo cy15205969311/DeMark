@@ -536,7 +536,15 @@ class MainWindow:
     
     def _on_extract_success(self, result: Dict):
         """提取成功回调"""
-        logging.info(f"✅ 提取成功: {result.get('imageUrl', '')[:80]}")
+        primary_url = self._get_primary_result_image_url(result) or ''
+        page_count = result.get('pageCount') or len(self._get_result_image_urls(result)) or 1
+        logging.info(f"✅ 提取成功: {primary_url[:80]}")
+        
+        # 添加北京时间时间戳
+        from datetime import datetime, timezone, timedelta
+        beijing_tz = timezone(timedelta(hours=8))
+        beijing_time = datetime.now(beijing_tz)
+        result['timestamp'] = beijing_time.strftime('%Y-%m-%d %H:%M:%S')
         
         # 添加到结果列表
         self.results.append(result)
@@ -547,8 +555,11 @@ class MainWindow:
         
         # 更新状态
         self._update_status()
-        
-        messagebox.showinfo("成功", "图片提取成功！")
+
+        if page_count > 1:
+            messagebox.showinfo("成功", f"设计稿提取成功，共 {page_count} 张页面。")
+        else:
+            messagebox.showinfo("成功", "图片提取成功！")
     
     def _on_extract_error(self, error_msg: str):
         """提取失败回调"""
@@ -598,6 +609,28 @@ class MainWindow:
             if col >= max_cols:
                 col = 0
                 row += 1
+
+    def _get_result_image_urls(self, result: Dict) -> List[str]:
+        """返回结果中包含的全部图片URL，保持页面顺序。"""
+        image_urls: List[str] = []
+        seen = set()
+
+        for image_url in result.get('imageUrls', []) or []:
+            if isinstance(image_url, str) and image_url and image_url not in seen:
+                image_urls.append(image_url)
+                seen.add(image_url)
+
+        primary_url = result.get('imageUrl')
+        if isinstance(primary_url, str) and primary_url and primary_url not in seen:
+            image_urls.insert(0, primary_url)
+            seen.add(primary_url)
+
+        return image_urls
+
+    def _get_primary_result_image_url(self, result: Dict) -> Optional[str]:
+        """返回结果中的首张图片URL。"""
+        image_urls = self._get_result_image_urls(result)
+        return image_urls[0] if image_urls else None
     
     def _create_result_card(self, result: Dict, row: int, col: int):
         """创建结果卡片 - 网格布局"""
@@ -615,6 +648,8 @@ class MainWindow:
         # 配置卡片内部网格
         card.grid_columnconfigure(0, weight=1)
         card.grid_rowconfigure(1, weight=1)
+        primary_url = self._get_primary_result_image_url(result)
+        page_count = result.get('pageCount') or len(self._get_result_image_urls(result))
         
         # 卡片头部
         header = ctk.CTkFrame(card, fg_color="transparent", height=50)
@@ -623,7 +658,7 @@ class MainWindow:
         header.grid_columnconfigure(1, weight=1)
         
         # 状态图标
-        success = result.get('imageUrl') is not None
+        success = primary_url is not None
         status_icon = "✅" if success else "❌"
         status_color = "#2d8f2d" if success else "#d32f2f"
         
@@ -666,6 +701,27 @@ class MainWindow:
         )
         source_label.pack(fill="x")
         
+        # 显示时间戳
+        if result.get('timestamp'):
+            timestamp_label = ctk.CTkLabel(
+                platform_info,
+                text=f"🕐 {result.get('timestamp')}",
+                font=("Microsoft YaHei UI", 9),
+                text_color="gray50",
+                anchor="w"
+            )
+            timestamp_label.pack(fill="x")
+
+        if success and page_count > 1:
+            page_label = ctk.CTkLabel(
+                platform_info,
+                text=f"📚 {page_count} 页设计稿",
+                font=("Microsoft YaHei UI", 9),
+                text_color="#7fd3ff",
+                anchor="w"
+            )
+            page_label.pack(fill="x")
+        
         # 卡片内容
         content = ctk.CTkFrame(card, fg_color="transparent")
         content.grid(row=1, column=0, sticky="nsew", padx=15, pady=5)
@@ -673,7 +729,7 @@ class MainWindow:
         
         if success:
             # 成功时显示URL
-            url_text = result.get('imageUrl', '')
+            url_text = primary_url or ''
             if len(url_text) > 60:
                 url_text = url_text[:60] + "..."
             
@@ -710,7 +766,7 @@ class MainWindow:
             copy_btn = ctk.CTkButton(
                 btn_frame,
                 text="📋 复制",
-                command=lambda: self._copy_url(result.get('imageUrl')),
+                command=lambda: self._copy_url(primary_url),
                 width=80,
                 height=28,
                 corner_radius=6,
@@ -723,7 +779,7 @@ class MainWindow:
             preview_btn = ctk.CTkButton(
                 btn_frame,
                 text="👁️ 预览",
-                command=lambda: self._preview_image(result.get('imageUrl')),
+                command=lambda: self._preview_image(primary_url),
                 width=80,
                 height=28,
                 corner_radius=6,
@@ -744,6 +800,8 @@ class MainWindow:
                 fg_color="#2d8f2d",
                 hover_color="#1e5f1e"
             )
+            if page_count > 1:
+                download_btn.configure(text="整套下载", width=92)
             download_btn.pack(side="left")
     
     def _detect_platform(self, url: str) -> str:
@@ -819,149 +877,173 @@ class MainWindow:
         """预览图片"""
         if url:
             webbrowser.open(url)
+
+    def _collect_download_items(self, results: List[Dict]) -> List[Dict]:
+        """将结果列表拍平成实际要下载的图片项。"""
+        download_items: List[Dict] = []
+        for result in results:
+            image_urls = self._get_result_image_urls(result)
+            for index, image_url in enumerate(image_urls, start=1):
+                download_items.append({
+                    'imageUrl': image_url,
+                    'platform': result.get('platform', 'Unknown'),
+                    'page': index,
+                    'pageCount': len(image_urls)
+                })
+        return download_items
     
     def _download_image(self, result: Dict):
-        """下载单张图片"""
+        """下载单个结果，若为多页则下载整套设计稿。"""
         if self.is_downloading:
             messagebox.showwarning("提示", "正在下载中，请稍候...")
             return
-        
-        image_url = result.get('imageUrl')
+
+        image_urls = self._get_result_image_urls(result)
         platform = result.get('platform', 'Unknown')
-        
-        if not image_url:
+
+        if not image_urls:
             messagebox.showerror("错误", "无效的图片URL")
             return
-        
-        # 在新线程中执行下载
+
         def download_thread():
             try:
-                # 创建新的事件循环
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                loop.run_until_complete(self._async_download_single(image_url, platform))
+                loop.run_until_complete(self._async_download_single(image_urls, platform))
             finally:
                 loop.close()
-        
+
         threading.Thread(target=download_thread, daemon=True).start()
-    
-    async def _async_download_single(self, image_url: str, platform: str):
-        """异步下载单张图片"""
+
+    async def _async_download_single(self, image_urls: List[str], platform: str):
+        """异步下载单个结果，支持整套设计稿。"""
         try:
             self.is_downloading = True
-            self._safe_update_status("📥 开始下载图片...")
-            
-            # 进度回调函数
+            page_count = len(image_urls)
+
+            if page_count > 1:
+                self._safe_update_status(f"📥 开始下载整套设计稿，共 {page_count} 张...")
+            else:
+                self._safe_update_status("📥 开始下载图片...")
+
             def progress_callback(progress, downloaded, total):
                 if total > 0:
                     message = f"📥 下载中... {progress:.1f}% ({downloaded}/{total} bytes)"
                     self._safe_update_status(message)
-            
-            # 执行下载
-            result = await self.downloader.download_image(
-                image_url, 
-                progress_callback=progress_callback,
-                platform=platform
-            )
-            
-            if result['success']:
-                message = f"✅ 下载完成: {result['filename']}"
-                self._safe_update_status(message)
-                # 使用线程安全的消息框
-                self.root.after(0, lambda: messagebox.showinfo("下载完成", f"图片已保存到: {result['file_path']}"))
+
+            if page_count > 1:
+                batch_result = await self.downloader.batch_download(
+                    image_urls,
+                    progress_callback=lambda completed, total, batch_item: self._safe_update_status(
+                        f"📦 整套下载进度: {completed}/{total} - {'成功' if batch_item.get('success') else '失败'}"
+                    ),
+                    platform=platform,
+                    max_concurrent=3
+                )
+
+                if batch_result['success']:
+                    successful = batch_result['successful']
+                    failed = batch_result['failed']
+                    self._safe_update_status(f"✅ 整套设计稿下载完成: 成功 {successful}，失败 {failed}")
+                    self.root.after(
+                        0,
+                        lambda: messagebox.showinfo(
+                            "下载完成",
+                            f"整套设计稿下载完成。\n成功: {successful} 张\n失败: {failed} 张"
+                        )
+                    )
+                else:
+                    error_msg = batch_result.get('error', 'Unknown error')
+                    self._safe_update_status(f"❌ 下载失败: {error_msg}")
+                    self.root.after(0, lambda: messagebox.showerror("下载失败", error_msg))
             else:
-                error_msg = result.get('error', 'Unknown error')
-                message = f"❌ 下载失败: {error_msg}"
-                self._safe_update_status(message)
-                self.root.after(0, lambda: messagebox.showerror("下载失败", error_msg))
-                
+                result = await self.downloader.download_image(
+                    image_urls[0],
+                    progress_callback=progress_callback,
+                    platform=platform
+                )
+
+                if result['success']:
+                    message = f"✅ 下载完成: {result['filename']}"
+                    self._safe_update_status(message)
+                    self.root.after(0, lambda: messagebox.showinfo("下载完成", f"图片已保存到: {result['file_path']}"))
+                else:
+                    error_msg = result.get('error', 'Unknown error')
+                    self._safe_update_status(f"❌ 下载失败: {error_msg}")
+                    self.root.after(0, lambda: messagebox.showerror("下载失败", error_msg))
+
         except Exception as e:
-            message = f"❌ 下载异常: {e}"
-            self._safe_update_status(message)
+            self._safe_update_status(f"❌ 下载异常: {e}")
             self.root.after(0, lambda: messagebox.showerror("下载异常", str(e)))
         finally:
+            await self.downloader.close()
             self.is_downloading = False
     
     def _download_all_images(self):
-        """下载所有成功提取的图片"""
+        """下载所有成功结果中的全部页面。"""
         if self.is_downloading:
             messagebox.showwarning("提示", "正在下载中，请稍候...")
             return
-        
-        # 获取所有成功的结果
-        successful_results = [r for r in self.results if r.get('imageUrl')]
-        
+
+        successful_results = [r for r in self.results if self._get_result_image_urls(r)]
         if not successful_results:
             messagebox.showwarning("提示", "没有可下载的图片")
             return
-        
-        # 确认下载
-        if not messagebox.askyesno("确认下载", f"确定要下载 {len(successful_results)} 张图片吗？"):
+
+        total_images = len(self._collect_download_items(successful_results))
+        if not messagebox.askyesno("确认下载", f"确定要下载 {len(successful_results)} 组结果，共 {total_images} 张图片吗？"):
             return
-        
-        # 在新线程中执行批量下载
+
         def download_thread():
             try:
-                # 创建新的事件循环
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(self._async_download_batch(successful_results))
             finally:
                 loop.close()
-        
+
         threading.Thread(target=download_thread, daemon=True).start()
     
     async def _async_download_batch(self, results: List[Dict]):
-        """异步批量下载图片"""
+        """异步批量下载全部页面。"""
         try:
             self.is_downloading = True
-            message = f"📦 开始批量下载 {len(results)} 张图片..."
+            download_items = self._collect_download_items(results)
+            message = f"📦 开始批量下载 {len(download_items)} 张图片..."
             self._safe_update_status(message)
-            
-            # 提取URL和平台信息
-            download_tasks = []
-            for result in results:
-                image_url = result.get('imageUrl')
-                platform = result.get('platform', 'Unknown')
-                if image_url:
-                    download_tasks.append((image_url, platform))
-            
-            # 进度回调函数
+
             def progress_callback(completed, total, result):
                 progress = (completed / total) * 100
                 status = "成功" if result.get('success') else "失败"
-                message = f"📦 批量下载进度: {completed}/{total} ({progress:.1f}%) - 最新: {status}"
-                self._safe_update_status(message)
-            
-            # 执行批量下载
-            image_urls = [task[0] for task in download_tasks]
-            platform = download_tasks[0][1] if download_tasks else "Mixed"
-            
+                self._safe_update_status(f"📦 批量下载进度: {completed}/{total} ({progress:.1f}%) - 最新: {status}")
+
+            image_urls = [item['imageUrl'] for item in download_items]
+            platforms = {item['platform'] for item in download_items}
+            platform = platforms.pop() if len(platforms) == 1 else "Mixed"
+
             batch_result = await self.downloader.batch_download(
                 image_urls,
                 progress_callback=progress_callback,
                 platform=platform,
                 max_concurrent=3
             )
-            
+
             if batch_result['success']:
                 successful = batch_result['successful']
                 failed = batch_result['failed']
-                message = f"✅ 批量下载完成: 成功 {successful}, 失败 {failed}"
-                self._safe_update_status(message)
-                success_msg = f"下载完成！\n成功: {successful} 张\n失败: {failed} 张"
+                self._safe_update_status(f"✅ 批量下载完成: 成功 {successful}, 失败 {failed}")
+                success_msg = f"下载完成！\n结果组数: {len(results)}\n图片总数: {len(download_items)}\n成功: {successful} 张\n失败: {failed} 张"
                 self.root.after(0, lambda: messagebox.showinfo("批量下载完成", success_msg))
             else:
                 error_msg = batch_result.get('error', 'Unknown error')
-                message = f"❌ 批量下载失败: {error_msg}"
-                self._safe_update_status(message)
+                self._safe_update_status(f"❌ 批量下载失败: {error_msg}")
                 self.root.after(0, lambda: messagebox.showerror("批量下载失败", error_msg))
                 
         except Exception as e:
-            message = f"❌ 批量下载异常: {e}"
-            self._safe_update_status(message)
+            self._safe_update_status(f"❌ 批量下载异常: {e}")
             self.root.after(0, lambda: messagebox.showerror("批量下载异常", str(e)))
         finally:
+            await self.downloader.close()
             self.is_downloading = False
     
     def _update_status(self, message: str = None):

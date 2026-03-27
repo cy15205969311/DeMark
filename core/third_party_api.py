@@ -80,6 +80,9 @@ class ThirdPartyAPIGateway:
         调用TSGPT API - 完全对应Node.js版本
         增加Content-Type检查，防止HTML响应导致JSON解析错误
         """
+        if self.session and self.session.closed:
+            self.session = None
+
         if not self.session:
             self.session = aiohttp.ClientSession()
         
@@ -171,3 +174,4 @@ class ThirdPartyAPIGateway:
         """关闭会话"""
         if self.session:
             await self.session.close()
+            self.session = None
