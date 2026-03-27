@@ -10,6 +10,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.image_extractor import ImageExtractor
+from core.browser_service import BrowserService
+from crawlers.tuguaishou_818ps import Tuguaishou818psCrawler
 from utils.image_validator import ImageValidator
 from utils.variant_builder import VariantBuilder
 
@@ -78,6 +80,15 @@ class TestImageValidator:
         result = await validator.validate_image_url(test_url)
         assert result is False
 
+    def test_extract_reported_size_from_content_range(self, validator):
+        """测试从 Content-Range 解析真实文件大小"""
+        headers = {
+            'Content-Range': 'bytes 0-0/54321',
+            'Content-Length': '1'
+        }
+
+        assert validator._extract_reported_size(headers) == 54321
+
 class TestVariantBuilder:
     """变体构建器测试"""
     
@@ -112,6 +123,112 @@ class TestVariantBuilder:
         
         # 检查是否包含原图替换
         assert any("original" in variant for variant in variants)
+
+class TestBrowserService:
+    """浏览器服务测试"""
+
+    def test_parse_chrome_major_version(self):
+        """测试Chrome主版本解析"""
+        service = BrowserService()
+
+        assert service._parse_chrome_major_version("Google Chrome 146.0.7680.165") == 146
+        assert service._parse_chrome_major_version("Chromium 120.1") == 120
+        assert service._parse_chrome_major_version("") is None
+
+    def test_extract_browser_version_from_error(self):
+        """测试从异常中提取浏览器版本"""
+        service = BrowserService()
+        error = Exception(
+            "session not created: This version of ChromeDriver only supports Chrome version 144 "
+            "Current browser version is 146.0.7680.165"
+        )
+
+        assert service._extract_browser_version_from_error(error) == 146
+
+class Test818psCrawler:
+    """818ps爬虫测试"""
+
+    @pytest.mark.asyncio
+    async def test_share_link_prefers_direct_build_when_upic_id_exists(self):
+        """测试用户分享链接在拿到upicId后优先走直连构造"""
+        crawler = Tuguaishou818psCrawler()
+        call_state = {
+            'direct_build': 0,
+            'scrape': 0,
+        }
+
+        async def fake_direct_build(upic_id, pic_id=None):
+            call_state['direct_build'] += 1
+            return {
+                'imageUrl': f'https://img.818ps.com/user_preview_ue/{upic_id}.jpg',
+                'platform': '818ps',
+                'source': 'user_path_priority'
+            }
+
+        async def fake_scrape(url):
+            call_state['scrape'] += 1
+            return None
+
+        crawler._extract_with_upic_id_priority = fake_direct_build
+        crawler._scrape_webpage_enhanced = fake_scrape
+
+        result = await crawler.extract_image(
+            "https://ue.818ps.com/v4/?upicId=311210634&share_id=1783630",
+            {'upic_id': '311210634'}
+        )
+
+        await crawler.close()
+
+        assert result is not None
+        assert result['source'] == 'user_path_priority'
+        assert call_state['direct_build'] == 1
+        assert call_state['scrape'] == 0
+
+    @pytest.mark.asyncio
+    async def test_dynamic_page_uses_static_fallback_before_browser(self):
+        """测试动态页先走静态HTML回退，不把成功率全部压在浏览器上"""
+        crawler = Tuguaishou818psCrawler()
+
+        async def fake_static(url):
+            return {
+                'imageUrl': 'https://img.818ps.com/user_preview_ue/311210634.jpg',
+                'platform': '818ps',
+                'source': 'meta_image'
+            }
+
+        crawler._extract_dynamic_page_without_browser = fake_static
+
+        result = await crawler._extract_dynamic_page(
+            "https://ue.818ps.com/v4/?upicId=311210634&share_id=1783630"
+        )
+
+        assert result is not None
+        assert result['source'] == 'meta_image'
+
+    @pytest.mark.asyncio
+    async def test_first_valid_candidate_does_not_wait_for_slower_ones(self):
+        """测试候选校验命中后会立刻返回，不等待更慢的超时项"""
+        crawler = Tuguaishou818psCrawler()
+
+        async def fake_validate(url):
+            if url.endswith("slow.jpg"):
+                await asyncio.sleep(0.2)
+                return False
+            if url.endswith("fast.jpg"):
+                await asyncio.sleep(0.01)
+                return True
+            return False
+
+        crawler.validator.validate_image_url = fake_validate
+
+        result = await crawler._find_first_valid_candidate([
+            "https://img.818ps.com/user_preview_ue/slow.jpg",
+            "https://img.818ps.com/user_preview_ue/fast.jpg",
+        ])
+
+        await crawler.close()
+
+        assert result.endswith("fast.jpg")
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

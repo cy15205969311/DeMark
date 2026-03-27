@@ -5,6 +5,8 @@
 import logging
 import os
 import sys
+import re
+import subprocess
 from typing import Optional
 import time
 
@@ -39,31 +41,119 @@ class BrowserService:
         """
         获取本地Chrome浏览器的主版本号
         """
-        try:
-            chrome_path = self._find_chrome_executable()
-            if not chrome_path:
-                return None
-            
-            import subprocess
-            # 修复编码问题
-            version_output = subprocess.check_output([
-                chrome_path, '--version'
-            ], stderr=subprocess.STDOUT, text=True, timeout=10, encoding='utf-8', errors='ignore')
-            
-            # 解析版本号 (例如: "Google Chrome 144.0.6367.60" -> 144)
-            import re
-            version_match = re.search(r'(\d+)\.', version_output)
-            if version_match:
-                major_version = int(version_match.group(1))
-                logging.info(f"🔍 检测到Chrome版本: {major_version}")
-                return major_version
-            
-        except subprocess.TimeoutExpired:
-            logging.warning("⚠️ Chrome版本检测超时")
-        except Exception as e:
-            logging.warning(f"⚠️ Chrome版本检测失败: {e}")
-        
+        chrome_path = self._find_chrome_executable()
+        if not chrome_path:
+            return None
+
+        version_sources = [
+            self._get_windows_file_version,
+            self._get_version_from_command,
+        ]
+
+        for getter in version_sources:
+            try:
+                major_version = getter(chrome_path)
+                if major_version:
+                    logging.info(f"🔍 检测到Chrome版本: {major_version}")
+                    return major_version
+            except Exception as e:
+                logging.debug(f"Chrome版本探测方法失败: {getter.__name__} - {e}")
+
+        logging.warning("⚠️ 未能自动检测到Chrome版本，将交给驱动自动匹配")
         return None
+
+    def _parse_chrome_major_version(self, version_text: str) -> Optional[int]:
+        """
+        从任意版本字符串中提取Chrome主版本号
+        """
+        if not version_text:
+            return None
+
+        version_match = re.search(r'(\d+)\.(\d+)\.(\d+)\.(\d+)', version_text)
+        if version_match:
+            return int(version_match.group(1))
+
+        version_match = re.search(r'(\d+)\.', version_text)
+        if version_match:
+            return int(version_match.group(1))
+
+        return None
+
+    def _get_windows_file_version(self, chrome_path: str) -> Optional[int]:
+        """
+        Windows 下优先通过文件元数据读取版本，避免直接执行 chrome.exe --version 卡住
+        """
+        if os.name != 'nt':
+            return None
+
+        try:
+            escaped_path = chrome_path.replace("'", "''")
+            command = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-Item -LiteralPath '{escaped_path}').VersionInfo.ProductVersion"
+            ]
+            version_output = subprocess.check_output(
+                command,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=5,
+                encoding='utf-8',
+                errors='ignore'
+            )
+            return self._parse_chrome_major_version(version_output.strip())
+        except subprocess.TimeoutExpired:
+            logging.debug("Windows 文件版本检测超时")
+            return None
+
+    def _get_version_from_command(self, chrome_path: str) -> Optional[int]:
+        """
+        通过 chrome.exe --version 获取版本，作为通用回退方案
+        """
+        try:
+            version_output = subprocess.check_output(
+                [chrome_path, '--version'],
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=5,
+                encoding='utf-8',
+                errors='ignore'
+            )
+            return self._parse_chrome_major_version(version_output.strip())
+        except subprocess.TimeoutExpired:
+            logging.warning("⚠️ Chrome版本命令检测超时")
+            return None
+
+    def _extract_browser_version_from_error(self, error: Exception) -> Optional[int]:
+        """
+        从驱动异常里反推出真实浏览器版本
+        """
+        error_text = str(error)
+        patterns = [
+            r'Current browser version is (\d+)\.',
+            r'Current browser version is (\d+)',
+            r'browser version is (\d+)\.',
+        ]
+
+        for pattern in patterns:
+            version_match = re.search(pattern, error_text, re.IGNORECASE)
+            if version_match:
+                return int(version_match.group(1))
+
+        return None
+
+    def _build_driver_kwargs(self, options, version_main: Optional[int] = None) -> dict:
+        """
+        构建 undetected-chromedriver 参数
+        """
+        kwargs = {
+            'options': options,
+            'driver_executable_path': None,
+        }
+        if version_main is not None:
+            kwargs['version_main'] = version_main
+        return kwargs
     
     def _get_stealth_driver(self, headless: bool = True):
         """
@@ -92,7 +182,6 @@ class BrowserService:
             options.add_argument('--disable-plugins')
             # 注意: 为了支持动态渲染，不禁用JavaScript
             # options.add_argument('--disable-javascript')  # 移除此选项
-            options.add_argument('--disable-images')  # 仍然禁用图片加载提升速度
             
             # 网络优化
             options.add_argument('--aggressive-cache-discard')
@@ -107,7 +196,7 @@ class BrowserService:
             
             # 隐身模式
             if headless:
-                options.add_argument('--headless')
+                options.add_argument('--headless=new')
                 logging.info("🔇 启用无头模式")
             
             # 窗口大小
@@ -126,18 +215,43 @@ class BrowserService:
             try:
                 # 获取本地Chrome版本
                 chrome_version = self._get_chrome_version()
-                if chrome_version:
-                    logging.info(f"🔒 锁定Chrome驱动版本: {chrome_version}")
-                    version_main = chrome_version
-                else:
-                    logging.warning("⚠️ 无法检测Chrome版本，使用默认版本144")
-                    version_main = 144  # 默认版本，避免版本不匹配
-                
-                driver = uc.Chrome(
-                    options=options,
-                    version_main=version_main,  # 🔒 强制版本锁定
-                    driver_executable_path=None,  # 自动下载对应版本驱动
-                )
+                version_candidates = []
+                attempted_versions = set()
+
+                def enqueue_version(version_candidate):
+                    key = 'auto' if version_candidate is None else int(version_candidate)
+                    if key in attempted_versions:
+                        return
+                    attempted_versions.add(key)
+                    version_candidates.append(version_candidate)
+
+                enqueue_version(chrome_version)
+                enqueue_version(None)
+
+                driver = None
+                last_error = None
+
+                while version_candidates:
+                    version_main = version_candidates.pop(0)
+                    try:
+                        if version_main is None:
+                            logging.info("🔄 尝试让驱动自动匹配当前Chrome版本")
+                        else:
+                            logging.info(f"🔒 尝试使用 Chrome {version_main} 对应驱动")
+
+                        driver = uc.Chrome(**self._build_driver_kwargs(options, version_main))
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logging.error(f"❌ Chrome驱动创建失败: {e}")
+
+                        inferred_version = self._extract_browser_version_from_error(e)
+                        if inferred_version and inferred_version != version_main:
+                            logging.info(f"🔁 从异常中识别到真实浏览器版本 {inferred_version}，加入重试")
+                            enqueue_version(inferred_version)
+
+                if driver is None:
+                    raise last_error or RuntimeError("Chrome驱动初始化失败")
                 
                 # 设置超时
                 driver.set_page_load_timeout(30)
@@ -175,8 +289,12 @@ class BrowserService:
                 
                 # 提供详细的错误诊断
                 if 'version' in str(e).lower():
+                    actual_version = self._extract_browser_version_from_error(e)
                     logging.info("💡 解决方案: Chrome版本不匹配")
-                    logging.info("   1. 更新Chrome浏览器到最新版本")
+                    if actual_version:
+                        logging.info(f"   1. 当前浏览器主版本是 {actual_version}，请确认驱动已匹配该版本")
+                    else:
+                        logging.info("   1. 请确认浏览器与驱动主版本一致")
                     logging.info("   2. 运行: pip install --upgrade undetected-chromedriver")
                 elif 'permission' in str(e).lower():
                     logging.info("💡 解决方案: 权限问题")
@@ -550,14 +668,10 @@ class BrowserService:
             result['path'] = chrome_path
             result['message'] = f"✅ Chrome已安装: {chrome_path}"
             
-            # 尝试获取版本信息
-            try:
-                import subprocess
-                version_output = subprocess.check_output([
-                    chrome_path, '--version'
-                ], stderr=subprocess.STDOUT, text=True, timeout=5)
-                result['version'] = version_output.strip()
-            except:
+            chrome_version = self._get_chrome_version()
+            if chrome_version:
+                result['version'] = f"{chrome_version}.x"
+            else:
                 result['version'] = "版本获取失败"
         else:
             result['message'] = "❌ 未检测到Chrome浏览器，建议安装: https://www.google.com/chrome/"

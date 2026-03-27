@@ -44,6 +44,57 @@ class Tuguaishou818psCrawler:
             'Sec-Fetch-Site': 'same-origin',
             'Upgrade-Insecure-Requests': '1'
         }
+
+    async def _find_first_valid_candidate(self, candidate_urls: List[str]) -> Optional[str]:
+        """
+        并发验证候选URL，返回最先验证成功的结果
+        一旦命中立即取消剩余任务，避免被慢超时拖住
+        """
+        async def validate(candidate_url: str):
+            return candidate_url, await self.validator.validate_image_url(candidate_url)
+
+        tasks = [asyncio.create_task(validate(candidate_url)) for candidate_url in candidate_urls]
+
+        try:
+            for future in asyncio.as_completed(tasks):
+                candidate_url, is_valid = await future
+                if is_valid:
+                    logging.info(f"✅ 找到有效候选URL: {candidate_url}")
+                    return candidate_url
+            return None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _find_best_scored_candidate(self, candidate_urls: List[str]) -> Tuple[Optional[str], int]:
+        """
+        并发验证并评分所有候选URL
+        """
+        async def validate(candidate_url: str):
+            is_valid, score = await self._validate_and_score_url(candidate_url)
+            return candidate_url, is_valid, score
+
+        tasks = [asyncio.create_task(validate(candidate_url)) for candidate_url in candidate_urls]
+        best_url = None
+        best_score = 0
+
+        try:
+            for future in asyncio.as_completed(tasks):
+                candidate_url, is_valid, score = await future
+                if is_valid and score > best_score:
+                    best_url = candidate_url
+                    best_score = score
+                    logging.info(f"✅ 找到更好的图片URL: {candidate_url} (评分: {score})")
+            return best_url, best_score
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
     
     async def extract_image(self, url: str, extracted_params: Optional[Dict] = None) -> Optional[Dict]:
         """
@@ -90,8 +141,15 @@ class Tuguaishou818psCrawler:
                            'ue.818ps.com' in url)
             
             if is_user_share:
-                logging.info("🚀 检测到用户分享链接，跳过ID猜测，直接启动动态抓取...")
-                # 直接跳转到网页抓取，避免浪费时间在静态URL构建上
+                if upic_id:
+                    logging.info("🚀 检测到用户分享链接且已拿到upicId，先尝试轻量直连构造...")
+                    result = await self._extract_with_upic_id_priority(upic_id, pic_id)
+                    if result:
+                        logging.info("✅ 用户分享链接直连构造成功，跳过动态抓取")
+                        return result
+                    logging.warning("⚠️ 用户分享链接直连构造未命中，回退到动态抓取...")
+                else:
+                    logging.info("🚀 检测到用户分享链接，但未拿到upicId，直接启动动态抓取...")
             else:
                 # 如果有upicId，优先执行ID构建策略（仅对非用户分享链接）
                 if upic_id:
@@ -201,31 +259,21 @@ class Tuguaishou818psCrawler:
                 f"https://tuguaishou.com/pic/{upic_id}.jpg",
                 f"https://tuguaishou.com/pic/{upic_id}.png",
             ])
+
+            candidates = list(dict.fromkeys(candidates))
             
             logging.info(f"🔄 验证 {len(candidates)} 个用户路径候选URL...")
-            
-            # 并发验证所有候选URL - 快速模式
-            validation_tasks = []
-            for candidate_url in candidates:
-                task = asyncio.create_task(self.validator.validate_image_url(candidate_url))
-                validation_tasks.append((candidate_url, task))
-            
-            # 等待验证完成，返回第一个有效的URL
-            for candidate_url, task in validation_tasks:
-                try:
-                    is_valid = await task
-                    if is_valid:
-                        logging.info(f"✅ 找到有效的用户路径URL: {candidate_url}")
-                        return {
-                            'imageUrl': candidate_url,
-                            'picId': pic_id,
-                            'upicId': upic_id,
-                            'platform': '818ps',
-                            'source': 'user_path_priority',
-                            'method': 'user_work_construction'
-                        }
-                except Exception as e:
-                    logging.debug(f"用户路径URL验证失败: {candidate_url} - {e}")
+
+            candidate_url = await self._find_first_valid_candidate(candidates)
+            if candidate_url:
+                return {
+                    'imageUrl': candidate_url,
+                    'picId': pic_id,
+                    'upicId': upic_id,
+                    'platform': '818ps',
+                    'source': 'user_path_priority',
+                    'method': 'user_work_construction'
+                }
             
             logging.warning("❌ 所有用户路径URL都验证失败")
             return None
@@ -263,26 +311,7 @@ class Tuguaishou818psCrawler:
             ]
             
             logging.info(f"🔄 验证 {len(possible_urls)} 个可能的图片URL...")
-            
-            # 并发验证所有URL (提高效率)
-            validation_tasks = []
-            for test_url in possible_urls:
-                task = asyncio.create_task(self._validate_and_score_url(test_url))
-                validation_tasks.append((test_url, task))
-            
-            # 等待所有验证完成
-            best_url = None
-            best_score = 0
-            
-            for test_url, task in validation_tasks:
-                try:
-                    is_valid, score = await task
-                    if is_valid and score > best_score:
-                        best_url = test_url
-                        best_score = score
-                        logging.info(f"✅ 找到更好的图片URL: {test_url} (评分: {score})")
-                except Exception as e:
-                    logging.debug(f"URL验证失败: {test_url} - {e}")
+            best_url, best_score = await self._find_best_scored_candidate(possible_urls)
             
             if best_url:
                 logging.info(f"🎯 最终选择: {best_url}")
@@ -398,6 +427,11 @@ class Tuguaishou818psCrawler:
         """
         提取动态渲染页面 - 使用浏览器服务
         """
+        logging.info("🧩 动态页先尝试静态HTML/JSON回退...")
+        static_result = await self._extract_dynamic_page_without_browser(url)
+        if static_result:
+            return static_result
+
         try:
             from core.browser_service import BrowserService
             browser_service = BrowserService()
@@ -413,7 +447,40 @@ class Tuguaishou818psCrawler:
             return result
             
         except Exception as e:
-            logging.error(f"❌ 动态页面提取失败: {e}")
+            logging.warning(f"⚠️ 浏览器动态抓取失败，动态页回退结束: {e}")
+            return None
+
+    async def _extract_dynamic_page_without_browser(self, url: str) -> Optional[Dict]:
+        """
+        动态页的轻量回退方案
+        浏览器启动失败时，仍然尝试用静态HTML提取可用信息
+        """
+        try:
+            async with self.session.get(url, timeout=15) as response:
+                if response.status != 200:
+                    logging.warning(f"⚠️ 动态页静态抓取失败，响应码: {response.status}")
+                    return None
+
+                html_content = await response.text()
+                logging.info(f"📄 动态页静态源码获取成功 ({len(html_content)} 字符)")
+
+            extractors = [
+                self._extract_meta_image_from_html,
+                self._extract_json_data,
+                self._extract_with_regex_fallback,
+                self._extract_with_beautifulsoup,
+            ]
+
+            for extractor in extractors:
+                result = await extractor(html_content, url)
+                if result:
+                    logging.info(f"✅ 动态页静态回退成功: {extractor.__name__}")
+                    return result
+
+            return None
+
+        except Exception as e:
+            logging.warning(f"⚠️ 动态页静态回退失败: {e}")
             return None
     
     async def _analyze_dynamic_data(self, dynamic_data: dict, url: str) -> Optional[Dict]:
@@ -634,6 +701,52 @@ class Tuguaishou818psCrawler:
             
         except Exception as e:
             logging.warning(f"⚠️ JSON数据提取失败: {e}")
+            return None
+
+    async def _extract_meta_image_from_html(self, html_content: str, url: str) -> Optional[Dict]:
+        """
+        从静态HTML的Meta标签中提取预览图
+        很多分享页即使是SPA，也会预渲染 og:image / twitter:image
+        """
+        try:
+            soup = BeautifulSoup(html_content, 'lxml')
+            meta_selectors = [
+                'meta[property="og:image"]',
+                'meta[property="og:image:url"]',
+                'meta[property="og:image:secure_url"]',
+                'meta[name="twitter:image"]',
+                'meta[name="twitter:image:src"]',
+            ]
+
+            for selector in meta_selectors:
+                element = soup.select_one(selector)
+                if not element:
+                    continue
+
+                image_url = (element.get('content') or '').strip()
+                if not image_url:
+                    continue
+
+                if image_url.startswith('//'):
+                    image_url = f'https:{image_url}'
+
+                if not self._is_valid_image_src(image_url):
+                    continue
+
+                final_url = await self._try_watermark_removal(image_url)
+                if await self.validator.validate_image_url(final_url):
+                    logging.info(f"🎯 Meta标签找到图片: {final_url}")
+                    return {
+                        'imageUrl': final_url,
+                        'platform': '818ps',
+                        'source': 'meta_image',
+                        'original_url': url
+                    }
+
+            return None
+
+        except Exception as e:
+            logging.warning(f"⚠️ Meta标签提取失败: {e}")
             return None
     
     async def _extract_with_beautifulsoup(self, html_content: str, url: str) -> Optional[Dict]:

@@ -370,18 +370,15 @@ class ImageExtractor:
             ]
             
             logging.info(f"🔄 验证 {len(possible_urls)} 个构建的图片URL...")
-            
-            # 并发验证所有URL
-            import asyncio
-            validation_tasks = []
-            for test_url in possible_urls:
-                task = asyncio.create_task(self.validator.validate_image_url(test_url))
-                validation_tasks.append((test_url, task))
-            
-            # 等待验证完成，选择第一个有效的URL
-            for test_url, task in validation_tasks:
-                try:
-                    is_valid = await task
+
+            async def validate_candidate(test_url: str):
+                return test_url, await self.validator.validate_image_url(test_url)
+
+            tasks = [asyncio.create_task(validate_candidate(test_url)) for test_url in possible_urls]
+
+            try:
+                for future in asyncio.as_completed(tasks):
+                    test_url, is_valid = await future
                     if is_valid:
                         logging.info(f"✅ 找到有效的构建URL: {test_url}")
                         return {
@@ -392,8 +389,12 @@ class ImageExtractor:
                             'source': 'params_constructed',
                             'method': 'direct_build'
                         }
-                except Exception as e:
-                    logging.debug(f"URL验证失败: {test_url} - {e}")
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
             
             logging.warning("❌ 所有构建的URL都无效")
             return None
