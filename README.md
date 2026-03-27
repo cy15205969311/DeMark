@@ -1,45 +1,93 @@
-# DeMark - 图怪兽爬虫项目
+# DeMark
 
-一个高效、智能的图怪兽(818ps.com)图片提取工具，支持多种分享链接格式和动态渲染页面。
+DeMark 是一个面向设计稿分享链接提取与下载的 Python 工具，提供 GUI 界面和可复用的提取核心，当前仓库重点支持以下平台：
 
-## ✨ 主要特性
+- 818ps / 图怪兽
+- Canva / 可画
+- Chuangkit / 创客贴
 
-- 🚀 **智能分流策略**: 自动识别用户分享链接，跳过无效构建，性能提升92%
-- � **版本锁定机制**: Chrome驱动版本自动匹配，避免版本冲突
-- 🌐 **动态页面支持**: 支持JavaScript渲染页面的JSON深度提取
-- 🎯 **三层架构**: API网关 → 本地爬虫 → Selenium隐身抓取
-- 🔍 **精准过滤**: 智能过滤统计图片，只提取高质量设计稿
-- 📊 **多重验证**: 文件大小检查 + HTTP状态码 + 黑名单过滤
+项目目标是尽可能稳定地从分享链接中提取真实设计稿预览图，并在识别到多页设计稿时输出整套图片结果，便于本地下载、二次开发和后续自动化处理。
 
-## 🏗️ 项目架构
+## 当前能力
 
+- 支持分享文本中的 URL 清洗、短链解析与平台识别
+- 支持 818ps / 图怪兽多页设计稿提取与批量下载
+- 支持创客贴多页设计稿提取
+- 支持 Canva 基础提取流程
+- 支持静态源码提取、动态浏览器抓取、资源监听与结果归一化
+- 统一输出单图 / 套图结构，方便 GUI 和脚本复用
+
+## 提取流程概览
+
+主调度入口在 [core/image_extractor.py](./core/image_extractor.py)，整体流程如下：
+
+1. 解析分享链接，清理输入文本中的 URL，并识别平台。
+2. 优先尝试第三方网关或平台可用的轻量接口。
+3. 回退到平台专用提取器，执行静态源码分析、候选图筛选与本地构造。
+4. 必要时启动浏览器动态抓取，采集页面资源、主画布快照与逐页结果。
+5. 将结果统一归一化为 `imageUrl`、`imageUrls`、`pages`、`pageCount` 等字段。
+
+## 多页提取说明
+
+### 818ps / 图怪兽
+
+- 优先使用分享接口与页面参数直连
+- 失败后回退到动态页抓取、滚动采样和逐页激活
+- 对水印图、素材图、SVG 小图、文字贴纸等干扰资源进行过滤
+
+详细说明见 [818ps套图提取逻辑说明.md](./818ps套图提取逻辑说明.md)。
+
+### 创客贴
+
+- 优先提取页面预加载的 `render_result` 设计稿资源
+- 如果仅拿到首张结果，再结合浏览器内资源快照和分页激活补齐整套设计稿
+- 对左侧推荐模板、装饰资源和非主画布图片进行降权过滤
+
+创客贴套图逻辑核心位于 [crawlers/chuangkit_crawler.py](./crawlers/chuangkit_crawler.py)。
+
+### Canva
+
+- 维持现有多源融合提取逻辑
+- 当前本次更新未改动 Canva 专用提取代码
+
+## 输出结构
+
+提取结果会统一规范为如下结构：
+
+```json
+{
+  "imageUrl": "https://example.com/page1.jpg",
+  "imageUrls": [
+    "https://example.com/page1.jpg",
+    "https://example.com/page2.jpg"
+  ],
+  "pages": [
+    { "page": 1, "imageUrl": "https://example.com/page1.jpg" },
+    { "page": 2, "imageUrl": "https://example.com/page2.jpg" }
+  ],
+  "pageCount": 2,
+  "isMultiPage": true,
+  "platform": "Chuangkit",
+  "source": "dynamic-resource-pages"
+}
 ```
-DeMark/
-├── core/                              # 核心模块
-│   ├── image_extractor.py             # 主图片提取器
-│   ├── browser_service.py             # 浏览器服务 (版本锁定)
-│   └── third_party_api.py             # 第三方API网关
-├── crawlers/
-│   └── tuguaishou_818ps.py            # 图怪兽爬虫 (智能分流)
-├── utils/
-│   ├── image_validator.py             # 图片验证器 (网络修复)
-│   ├── url_parser.py                  # URL解析器
-│   └── variant_builder.py             # 变体构建器
-├── gui/
-│   └── main_window.py                 # 图形界面
-├── config/
-│   └── settings.py                    # 配置文件
-└── tests/
-    └── test_basic.py                  # 基础测试
-```
 
-## 🚀 快速开始
+字段含义：
+
+- `imageUrl`：兼容旧逻辑的首张图
+- `imageUrls`：完整套图 URL 列表
+- `pages`：页码与图片 URL 的对应关系
+- `pageCount`：识别到的页面数量
+- `isMultiPage`：是否为多页设计稿
+- `source`：当前结果命中的提取来源
+
+## 快速开始
 
 ### 环境要求
 
 - Python 3.8+
-- Chrome浏览器
-- Windows/Linux/macOS
+- 已安装 Chrome 浏览器
+- Windows 环境下已做更多实际验证
 
 ### 安装依赖
 
@@ -47,151 +95,85 @@ DeMark/
 pip install -r requirements.txt
 ```
 
-### 基本使用
-
-```python
-import asyncio
-from core.image_extractor import ImageExtractor
-
-async def main():
-    extractor = ImageExtractor()
-    
-    # 支持多种链接格式
-    urls = [
-        "https://818ps.com/u/002dJRky-1?user_source=r1537041",  # 用户分享链接
-        "https://ue.818ps.com/preview/123456",                  # 动态渲染页面
-        "https://818ps.com/preview?picId=123&upicId=456"        # 普通预览链接
-    ]
-    
-    for url in urls:
-        result = await extractor.extract_image(url, "818ps")
-        if result:
-            print(f"✅ 提取成功: {result['imageUrl']}")
-        else:
-            print("❌ 提取失败")
-    
-    await extractor.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-### 命令行使用
+### 启动图形界面
 
 ```bash
 python main.py
 ```
 
-## 🎯 核心功能
+### 脚本调用示例
 
-### 1. 智能分流策略
+```python
+import asyncio
+from core.image_extractor import ImageExtractor
 
-自动识别用户分享链接，跳过无效的静态URL构建：
 
-- **用户分享链接**: 直接进入动态抓取 (~5秒)
-- **普通链接**: ID优先构建策略 (~2秒)
-- **性能提升**: 用户分享链接处理速度提升92%
+async def main():
+    extractor = ImageExtractor()
+    result = await extractor.extract_image(
+        "https://www.chuangkit.com/sharedesign?d=26205704-ac51-4516-94ee-104ac29b6c96",
+        "Chuangkit",
+    )
 
-### 2. 版本锁定机制
+    print("platform:", result.get("platform"))
+    print("source:", result.get("source"))
+    print("pageCount:", result.get("pageCount"))
 
-解决Chrome驱动版本不匹配问题：
+    for item in result.get("pages", []):
+        print(item["page"], item["imageUrl"])
 
-- 自动检测本地Chrome版本
-- 强制锁定对应驱动版本
-- 避免`SessionNotCreatedException`错误
+    await extractor.close()
 
-### 3. JSON深度提取
 
-支持动态渲染页面的数据提取：
-
-- JavaScript执行环境
-- 多层数据源分析 (window/JSON/direct)
-- 递归数据结构搜索
-- 智能图片URL评分
-
-### 4. 精准过滤系统
-
-避免提取统计图片和小图标：
-
-- 文件大小检查 (< 10KB过滤)
-- 黑名单关键词过滤
-- 相关性智能判断
-- URL特征评分算法
-
-## 📊 性能指标
-
-| 链接类型 | 修复前 | 修复后 | 改进幅度 |
-|---------|--------|--------|----------|
-| 用户分享链接 | ~60秒 | ~5秒 | **92% ⬇️** |
-| 普通链接 | ~2秒 | ~2秒 | 0% (保持高效) |
-| 动态页面 | 失败 | ~8秒 | **新增支持** |
-
-## 🔧 配置说明
-
-### Chrome设置
-
-程序会自动检测Chrome安装路径：
-- `C:\Program Files\Google\Chrome\Application\chrome.exe`
-- `C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`
-
-### 网络配置
-
-支持IPv4强制连接和双重验证机制：
-- 异步验证 (aiohttp)
-- 同步回退 (requests)
-- DNS缓存优化
-
-## 🧪 测试
-
-运行基础测试：
-
-```bash
-python tests/test_basic.py
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-快速功能测试：
+## 项目结构
 
-```bash
-python quick_test.py
+```text
+DeMark/
+├── core/                        核心调度、浏览器服务、结果归一化
+├── crawlers/                    平台专用提取器
+├── gui/                         图形界面
+├── tests/                       测试用例
+├── utils/                       URL 解析、验证、下载等公共能力
+├── 818ps套图提取逻辑说明.md      818ps / 图怪兽套图实现说明
+├── main.py                      GUI 启动入口
+└── README.md
 ```
 
-## 📝 更新日志
+## 关键模块
 
-### v2.0.0 (2026-01-31)
+- [core/image_extractor.py](./core/image_extractor.py)：总入口与多阶段调度
+- [core/browser_service.py](./core/browser_service.py)：浏览器抓取、动态资源采样与驱动管理
+- [crawlers/tuguaishou_818ps.py](./crawlers/tuguaishou_818ps.py)：818ps / 图怪兽提取逻辑
+- [crawlers/chuangkit_crawler.py](./crawlers/chuangkit_crawler.py)：创客贴提取与套图识别逻辑
+- [crawlers/canva_crawler.py](./crawlers/canva_crawler.py)：Canva 提取逻辑
+- [utils/downloader.py](./utils/downloader.py)：单图与整套下载
 
-#### 🚀 重大更新
-- **智能分流策略**: 用户分享链接性能提升92%
-- **版本锁定机制**: 解决Chrome驱动版本冲突
-- **JSON深度提取**: 支持动态渲染页面
-- **精准过滤系统**: 避免统计图片误提取
+## 测试
 
-#### 🔧 核心修复
-- 修复`AttributeError: '_extract_local'`崩溃问题
-- 修复`getaddrinfo failed`网络问题
-- 修复`SessionNotCreatedException`驱动问题
-- 修复逻辑回退机制阻断问题
+建议优先运行以下测试：
 
-#### ⚡ 性能优化
-- 用户分享链接: 60秒 → 5秒 (92%提升)
-- 网络验证: IPv4强制 + 双重验证
-- 浏览器启动: 版本自动匹配
-- 数据提取: 多层递归搜索
+```bash
+pytest tests/test_basic.py
+pytest tests/test_chuangkit.py
+```
 
-## 🤝 贡献
+如果本机没有安装 `pytest`，也可以先使用：
 
-欢迎提交Issue和Pull Request！
+```bash
+pip install pytest
+```
 
-## 📄 许可证
+## 注意事项
+
+- 动态抓取依赖本机 Chrome 浏览器。
+- 某些平台分享页是 SPA 或强动态渲染页面，静态 HTML 中拿不到设计稿属于正常情况。
+- 多页提取的关键不是“抓到所有图片”，而是“筛出真正的设计稿主画布结果”。
+- 浏览器抓取结果会受到页面登录态、资源过期时间和平台前端改版影响。
+
+## License
 
 MIT License
-
-## 🔗 相关链接
-
-- [图怪兽官网](https://818ps.com)
-- [项目文档](./PROJECT_ARCHITECTURE.md)
-
----
-
-**开发状态**: ✅ 稳定版本  
-**测试状态**: ✅ 全面测试  
-**维护状态**: 🔄 持续维护

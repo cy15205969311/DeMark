@@ -860,6 +860,34 @@ class BrowserService:
         if version_main is not None:
             kwargs['version_main'] = version_main
         return kwargs
+
+    def _build_chrome_options(self, uc, chrome_path: str, headless: bool):
+        """
+        每次驱动创建都生成一份新的 ChromeOptions，避免重试时复用对象。
+        """
+        options = uc.ChromeOptions()
+
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--disable-extensions')
+        options.add_argument('--disable-plugins')
+
+        options.add_argument('--aggressive-cache-discard')
+        options.add_argument('--disable-background-networking')
+        options.add_argument('--disable-background-timer-throttling')
+        options.add_argument('--disable-renderer-backgrounding')
+
+        options.add_argument('--enable-javascript')
+        options.add_argument('--allow-running-insecure-content')
+        options.add_argument('--disable-web-security')
+
+        if headless:
+            options.add_argument('--headless=new')
+
+        options.add_argument('--window-size=1920,1080')
+        options.binary_location = chrome_path
+        return options
     
     def _get_stealth_driver(self, headless: bool = True):
         """
@@ -945,7 +973,8 @@ class BrowserService:
                         else:
                             logging.info(f"🔒 尝试使用 Chrome {version_main} 对应驱动")
 
-                        driver = uc.Chrome(**self._build_driver_kwargs(options, version_main))
+                        attempt_options = self._build_chrome_options(uc, chrome_path, headless)
+                        driver = uc.Chrome(**self._build_driver_kwargs(attempt_options, version_main))
                         break
                     except Exception as e:
                         last_error = e
