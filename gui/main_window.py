@@ -48,6 +48,7 @@ class MainWindow:
         self.is_downloading = False
         self.success_count = 0
         self.fail_count = 0
+        self.warning_count = 0
         
         # 创建界面
         self._create_widgets()
@@ -111,7 +112,7 @@ class MainWindow:
         # URL 输入框
         self.url_entry = ctk.CTkEntry(
             input_frame,
-            placeholder_text="🔗 请输入图怪兽、Canva、创客贴等平台的分享链接...",
+            placeholder_text="🔗 请输入图怪兽、Canva、创客贴、稿定、花瓣等平台的分享链接...",
             font=("Microsoft YaHei UI", 12),
             height=40,
             corner_radius=8,
@@ -148,7 +149,7 @@ class MainWindow:
         # 使用分段按钮替代传统单选按钮
         self.platform_segmented = ctk.CTkSegmentedButton(
             platform_frame,
-            values=["🤖 自动", "🎨 图怪兽", "🎭 Canva", "📐 Chuangkit"],
+            values=["🤖 自动", "🎨 图怪兽", "🎭 Canva", "📐 Chuangkit", "🎯 稿定", "🌸 花瓣"],
             font=("Microsoft YaHei UI", 11),
             corner_radius=8,
             border_width=2,
@@ -426,7 +427,7 @@ class MainWindow:
             # 提示文字
             hint_text = ctk.CTkLabel(
                 empty_frame,
-                text="支持图怪兽、Canva、创客贴、抖音、小红书等平台",
+                text="支持图怪兽、Canva、创客贴、稿定、花瓣等平台",
                 font=("Microsoft YaHei UI", 12),
                 text_color="gray40"
             )
@@ -474,7 +475,9 @@ class MainWindow:
             "🤖 自动": "auto",
             "🎨 图怪兽": "818ps",
             "🎭 Canva": "Canva",
-            "📐 Chuangkit": "Chuangkit"
+            "📐 Chuangkit": "Chuangkit",
+            "🎯 稿定": "Gaoding",
+            "🌸 花瓣": "Huaban"
         }
         platform = platform_map.get(self.platform_segmented.get(), "auto")
         
@@ -512,7 +515,7 @@ class MainWindow:
             
         except Exception as e:
             # 在主线程中显示错误
-            self.root.after(0, self._on_extract_error, str(e))
+            self.root.after(0, self._on_extract_error, str(e), platform)
         finally:
             # 恢复按钮状态
             self.root.after(0, self._reset_extract_button)
@@ -536,40 +539,65 @@ class MainWindow:
     
     def _on_extract_success(self, result: Dict):
         """提取成功回调"""
+        result_status = result.get('status')
         primary_url = self._get_primary_result_image_url(result) or ''
         page_count = result.get('pageCount') or len(self._get_result_image_urls(result)) or 1
-        logging.info(f"✅ 提取成功: {primary_url[:80]}")
+        if result_status in {'preview_only', 'preview_image'}:
+            logging.warning(f"Huaban preview warning result: {result.get('error', '')}")
+        elif primary_url:
+            logging.info(f"✅ 提取成功: {primary_url[:80]}")
+        else:
+            logging.info(f"✅ 提取完成: {result.get('platform', 'Unknown')}")
         
-        # 添加北京时间时间戳
-        from datetime import datetime, timezone, timedelta
-        beijing_tz = timezone(timedelta(hours=8))
-        beijing_time = datetime.now(beijing_tz)
-        result['timestamp'] = beijing_time.strftime('%Y-%m-%d %H:%M:%S')
+        result['timestamp'] = self._build_result_timestamp()
         
         # 添加到结果列表
         self.results.append(result)
-        self.success_count += 1
+        if result_status in {'preview_only', 'preview_image'}:
+            self.warning_count += 1
+        else:
+            self.success_count += 1
         
         # 重新创建结果卡片
         self._refresh_result_gallery()
-        
-        # 更新状态
         self._update_status()
 
-        if page_count > 1:
+        if result_status == 'preview_only':
+            self._update_status("Huaban素材仅返回公开预览图，已在结果卡片中标注")
+        elif result_status == 'preview_image':
+            self._update_status("Huaban素材已提取公开预览图，可直接下载，但可能包含水印")
+        elif page_count > 1:
             messagebox.showinfo("成功", f"设计稿提取成功，共 {page_count} 张页面。")
         else:
             messagebox.showinfo("成功", "图片提取成功！")
     
-    def _on_extract_error(self, error_msg: str):
+    def _on_extract_error(self, error_msg: str, platform: str = 'Unknown'):
         """提取失败回调"""
         logging.error(f"❌ 提取失败: {error_msg}")
+
+        if self._is_huaban_preview_only_error(platform, error_msg):
+            logging.warning("Huaban preview-only limitation was routed through error handling; showing warning card instead")
+            self.results.append({
+                'status': 'preview_only',
+                'error': error_msg,
+                'warningText': '公开接口仅提供带水印预览图，未返回无水印原素材下载地址',
+                'platform': platform or 'Huaban',
+                'timestamp': self._build_result_timestamp()
+            })
+            self.warning_count += 1
+
+            # 重新创建结果卡片
+            self._refresh_result_gallery()
+            self._update_status()
+            self._update_status("Huaban素材仅返回公开预览图，已在结果卡片中标注")
+            return
         
         # 添加失败记录
         self.results.append({
             'success': False,
             'error': error_msg,
-            'platform': 'Unknown'
+            'platform': platform or 'Unknown',
+            'timestamp': self._build_result_timestamp()
         })
         self.fail_count += 1
         
@@ -631,6 +659,34 @@ class MainWindow:
         """返回结果中的首张图片URL。"""
         image_urls = self._get_result_image_urls(result)
         return image_urls[0] if image_urls else None
+
+    def _build_result_timestamp(self) -> str:
+        """Return a Beijing time timestamp string for result cards."""
+        from datetime import datetime, timezone, timedelta
+
+        beijing_tz = timezone(timedelta(hours=8))
+        return datetime.now(beijing_tz).strftime('%Y-%m-%d %H:%M:%S')
+
+    def _is_huaban_preview_only_error(self, platform: str, error_msg: str) -> bool:
+        """Detect Huaban preview-only limitations that were surfaced as errors."""
+        if (platform or '').lower() != 'huaban':
+            return False
+
+        message = error_msg or ''
+        normalized_message = message.lower()
+        return (
+            'preview_only' in normalized_message
+            or '公开接口仅返回带水印' in message
+            or ('预览图' in message and '水印' in message)
+        )
+
+    def _get_result_state(self, result: Dict) -> str:
+        """Return success / warning / error for UI rendering."""
+        if result.get('status') in {'preview_only', 'preview_image', 'manual_guidance'}:
+            return 'warning'
+        if self._get_primary_result_image_url(result):
+            return 'success'
+        return 'error'
     
     def _create_result_card(self, result: Dict, row: int, col: int):
         """创建结果卡片 - 网格布局"""
@@ -658,9 +714,11 @@ class MainWindow:
         header.grid_columnconfigure(1, weight=1)
         
         # 状态图标
-        success = primary_url is not None
-        status_icon = "✅" if success else "❌"
-        status_color = "#2d8f2d" if success else "#d32f2f"
+        result_state = self._get_result_state(result)
+        success = result_state == 'success'
+        has_image = primary_url is not None
+        status_icon = "✅" if result_state == 'success' else ("⚠" if result_state == 'warning' else "❌")
+        status_color = "#2d8f2d" if result_state == 'success' else ("#c49000" if result_state == 'warning' else "#d32f2f")
         
         status_frame = ctk.CTkFrame(
             header,
@@ -712,7 +770,7 @@ class MainWindow:
             )
             timestamp_label.pack(fill="x")
 
-        if success and page_count > 1:
+        if has_image and page_count > 1:
             page_label = ctk.CTkLabel(
                 platform_info,
                 text=f"📚 {page_count} 页设计稿",
@@ -727,8 +785,8 @@ class MainWindow:
         content.grid(row=1, column=0, sticky="nsew", padx=15, pady=5)
         content.grid_columnconfigure(0, weight=1)
         
-        if success:
-            # 成功时显示URL
+        if has_image:
+            # 有图时显示URL
             url_text = primary_url or ''
             if len(url_text) > 60:
                 url_text = url_text[:60] + "..."
@@ -742,32 +800,65 @@ class MainWindow:
                 wraplength=300
             )
             url_label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+            if result_state == 'warning':
+                warning_tag = ctk.CTkLabel(
+                    content,
+                    text="公开预览图",
+                    font=("Microsoft YaHei UI", 9, "bold"),
+                    text_color="#2b2106",
+                    fg_color="#d9a441",
+                    corner_radius=8,
+                    padx=10,
+                    pady=3
+                )
+                warning_tag.grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+                warning_text = result.get('warningText') or '已提取公开预览图，可能包含平台水印'
+                if len(warning_text) > 80:
+                    warning_text = warning_text[:80] + "..."
+
+                warning_label = ctk.CTkLabel(
+                    content,
+                    text=f"⚠ {warning_text}",
+                    font=("Microsoft YaHei UI", 10),
+                    text_color="#d9a441",
+                    anchor="w",
+                    wraplength=300
+                )
+                warning_label.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         else:
             # 失败时显示错误信息
-            error_text = result.get('error', '未知错误')
+            if result.get('status') == 'preview_only':
+                error_text = result.get('warningText') or '公开接口仅提供带水印预览图，未返回无水印原素材下载地址'
+            else:
+                error_text = result.get('error', '未知错误')
             if len(error_text) > 80:
                 error_text = error_text[:80] + "..."
             
+            error_color = "#d9a441" if result_state == 'warning' else "#ff6b6b"
+            error_prefix = "⚠ " if result_state == 'warning' else "❌ "
             error_label = ctk.CTkLabel(
                 content,
                 text=f"❌ {error_text}",
                 font=("Microsoft YaHei UI", 10),
-                text_color="#ff6b6b",
+                text_color=error_color,
                 anchor="w",
                 wraplength=300
             )
+            error_label.configure(text=f"{error_prefix}{error_text}")
             error_label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         
         # 操作按钮
-        if success:
+        if has_image:
             btn_frame = ctk.CTkFrame(content, fg_color="transparent")
-            btn_frame.grid(row=1, column=0, sticky="ew")
-            
+            btn_frame.grid(row=3 if result_state == 'warning' else 1, column=0, sticky="ew")
+             
             copy_btn = ctk.CTkButton(
                 btn_frame,
-                text="📋 复制",
+                text="📋 复制预览图" if result_state == 'warning' else "📋 复制",
                 command=lambda: self._copy_url(primary_url),
-                width=80,
+                width=92 if result_state == 'warning' else 80,
                 height=28,
                 corner_radius=6,
                 font=("Microsoft YaHei UI", 9),
@@ -778,9 +869,9 @@ class MainWindow:
             
             preview_btn = ctk.CTkButton(
                 btn_frame,
-                text="👁️ 预览",
+                text="👁️ 查看预览图" if result_state == 'warning' else "👁️ 预览",
                 command=lambda: self._preview_image(primary_url),
-                width=80,
+                width=98 if result_state == 'warning' else 80,
                 height=28,
                 corner_radius=6,
                 font=("Microsoft YaHei UI", 9),
@@ -797,12 +888,59 @@ class MainWindow:
                 height=28,
                 corner_radius=6,
                 font=("Microsoft YaHei UI", 9),
-                fg_color="#2d8f2d",
-                hover_color="#1e5f1e"
+                fg_color="#8a6a18" if result_state == 'warning' else "#2d8f2d",
+                hover_color="#6f5311" if result_state == 'warning' else "#1e5f1e"
             )
             if page_count > 1:
                 download_btn.configure(text="整套下载", width=92)
+            elif result_state == 'warning':
+                download_btn.configure(text="下载预览图", width=92)
             download_btn.pack(side="left")
+
+            if result_state == 'warning' and result.get('original_url'):
+                open_btn = ctk.CTkButton(
+                    btn_frame,
+                    text="🌐 打开原页",
+                    command=lambda: self._preview_image(result.get('original_url')),
+                    width=92,
+                    height=28,
+                    corner_radius=6,
+                    font=("Microsoft YaHei UI", 9),
+                    fg_color="gray60",
+                    hover_color="gray50"
+                )
+                open_btn.pack(side="left", padx=(8, 0))
+        elif result.get('status') == 'preview_only':
+            btn_frame = ctk.CTkFrame(content, fg_color="transparent")
+            btn_frame.grid(row=1, column=0, sticky="ew")
+
+            original_url = result.get('original_url')
+            if original_url:
+                copy_btn = ctk.CTkButton(
+                    btn_frame,
+                    text="📋 复制原链",
+                    command=lambda: self._copy_url(original_url),
+                    width=92,
+                    height=28,
+                    corner_radius=6,
+                    font=("Microsoft YaHei UI", 9),
+                    fg_color="#8a6a18",
+                    hover_color="#6f5311"
+                )
+                copy_btn.pack(side="left", padx=(0, 8))
+
+                open_btn = ctk.CTkButton(
+                    btn_frame,
+                    text="🌐 打开原页",
+                    command=lambda: self._preview_image(original_url),
+                    width=92,
+                    height=28,
+                    corner_radius=6,
+                    font=("Microsoft YaHei UI", 9),
+                    fg_color="gray60",
+                    hover_color="gray50"
+                )
+                open_btn.pack(side="left")
     
     def _detect_platform(self, url: str) -> str:
         """自动检测平台"""
@@ -813,6 +951,10 @@ class MainWindow:
             return 'Canva'
         elif 'chuangkit.com' in url_lower:
             return 'Chuangkit'
+        elif 'gaoding.com' in url_lower or 'gaoding.cn' in url_lower:
+            return 'Gaoding'
+        elif 'huaban.com' in url_lower or 'huabanimg.com' in url_lower:
+            return 'Huaban'
         else:
             return 'Unknown'
     
@@ -863,6 +1005,7 @@ class MainWindow:
             self.results.clear()
             self.success_count = 0
             self.fail_count = 0
+            self.warning_count = 0
             self._update_empty_state()
             self._update_status()
     
@@ -1055,7 +1198,7 @@ class MainWindow:
             # 否则显示默认状态
             total = len(self.results)
             self.status_label.configure(
-                text=f"🟢 就绪 | 成功: {self.success_count} | 失败: {self.fail_count} | 总计: {total}"
+                text=f"🟢 就绪 | 成功: {self.success_count} | 警告: {self.warning_count} | 失败: {self.fail_count} | 总计: {total}"
             )
     
     def _safe_update_status(self, message: str):

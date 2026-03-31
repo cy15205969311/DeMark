@@ -73,6 +73,8 @@ class URLParser:
                 return self._parse_chuangkit_share_url(clean_url, url)
             elif platform == "Gaoding":
                 return self._parse_gaoding_share_url(clean_url, url)
+            elif platform == "Huaban":
+                return self._parse_huaban_share_url(clean_url, url)
             else:
                 # 尝试直接使用原URL
                 return {
@@ -338,6 +340,8 @@ class URLParser:
             return 'Chuangkit'
         elif 'gaoding.com' in url_lower or 'gaoding.cn' in url_lower:
             return 'Gaoding'
+        elif 'huaban.com' in url_lower or 'api.huaban.com' in url_lower or 'huabanimg.com' in url_lower:
+            return 'Huaban'
         else:
             return 'Unknown'
     
@@ -417,6 +421,18 @@ class URLParser:
             'original_url': original_url,
             'parsed_url': cleaned_url,
             'platform': 'Gaoding',
+            'type': 'direct'
+        }
+
+    def _parse_huaban_share_url(self, url: str, original_url: str) -> Dict:
+        """Parse Huaban share URLs."""
+        parsed_url = urlparse(url)
+        cleaned_url = urlunparse(parsed_url._replace(fragment=''))
+        return {
+            'success': True,
+            'original_url': original_url,
+            'parsed_url': cleaned_url,
+            'platform': 'Huaban',
             'type': 'direct'
         }
     

@@ -15,6 +15,7 @@ from crawlers.tuguaishou_818ps import Tuguaishou818psCrawler
 from crawlers.canva_crawler import CanvaCrawler
 from crawlers.chuangkit_crawler import ChuangkitCrawler
 from crawlers.gaoding_crawler import GaodingCrawler
+from crawlers.huaban_crawler import HuabanCrawler
 
 class ImageExtractor:
     """
@@ -33,8 +34,26 @@ class ImageExtractor:
             '818ps': Tuguaishou818psCrawler(),
             'Canva': CanvaCrawler(),
             'Chuangkit': ChuangkitCrawler(),
-            'Gaoding': GaodingCrawler()
+            'Gaoding': GaodingCrawler(),
+            'Huaban': HuabanCrawler()
         }
+
+    async def _extract_huaban(self, url: str, parsed_params: dict = None) -> Optional[Dict]:
+        """Extract Huaban images with the dedicated crawler."""
+        try:
+            logging.info(f"Start Huaban local extraction: {url}")
+            del parsed_params
+
+            if 'Huaban' in self.crawlers:
+                crawler = self.crawlers['Huaban']
+                return await crawler.extract_image(url)
+
+            logging.warning("Huaban crawler not initialized")
+            return None
+
+        except Exception as e:
+            logging.error(f"Huaban extraction failed: {e}")
+            return None
 
     def _normalize_result_images(self, result: Optional[Dict]) -> Optional[Dict]:
         """Unify single-image and multi-image results into one structure."""
@@ -98,8 +117,12 @@ class ImageExtractor:
                 logging.warning(f"⚠️ URL解析失败，使用原URL: {parse_result.get('error', '')}")
             
             # ========== 阶段1: 第三方API网关 (80%命中率) ==========
-            logging.info("📡 阶段1: 尝试第三方API网关...")
-            api_result = await self.third_party_api.extract_with_cache(processed_url, platform)
+            if platform == 'Huaban':
+                logging.info("📡 阶段1: Huaban使用官方公开接口，跳过第三方API网关")
+                api_result = None
+            else:
+                logging.info("📡 阶段1: 尝试第三方API网关...")
+                api_result = await self.third_party_api.extract_with_cache(processed_url, platform)
             
             if api_result and api_result.get('success') and api_result.get('imageUrl'):
                 # 验证API返回的图片URL
@@ -127,6 +150,20 @@ class ImageExtractor:
             local_result = await self._extract_local(processed_url, platform, extracted_params)
             
             if local_result:
+                if local_result.get('status') == 'preview_only':
+                    logging.info("Huaban preview-only result returned")
+                    return self._normalize_result_images({
+                        **local_result,
+                        'original_url': url,
+                        'processed_url': processed_url
+                    })
+                if local_result.get('status') == 'preview_image':
+                    logging.info("Huaban preview-image result returned")
+                    return self._normalize_result_images({
+                        **local_result,
+                        'original_url': url,
+                        'processed_url': processed_url
+                    })
                 # 检查是否是用户指导响应
                 if local_result.get('status') == 'manual_guidance':
                     logging.info("🤝 【用户指导】本地提取返回用户指导")
@@ -336,6 +373,8 @@ class ImageExtractor:
                 return await self._extract_chuangkit(url, parsed_params)
             elif platform == 'Gaoding':
                 return await self._extract_gaoding(url, parsed_params)
+            elif platform == 'Huaban':
+                return await self._extract_huaban(url, parsed_params)
             else:
                 logging.warning(f"⚠️ 不支持的平台: {platform}")
                 return None

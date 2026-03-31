@@ -98,11 +98,12 @@ class ImageDownloader:
             )
             
             if download_result['success']:
+                final_file_path = Path(download_result.get('file_path') or file_path)
                 logging.info(f"✅ 下载完成: {file_path} ({download_result['size']} bytes)")
                 return {
                     'success': True,
-                    'file_path': str(file_path),
-                    'filename': filename,
+                    'file_path': str(final_file_path),
+                    'filename': final_file_path.name,
                     'size': download_result['size'],
                     'status': 'downloaded',
                     'download_time': download_result.get('download_time', 0)
@@ -151,6 +152,48 @@ class ImageDownloader:
             connector=connector,
             headers=headers
         )
+
+    def _build_request_headers(self, image_url: str) -> Dict[str, str]:
+        """Build per-request headers for hosts with anti-hotlink protection."""
+        headers: Dict[str, str] = {}
+        hostname = (urlparse(image_url).hostname or '').lower()
+
+        if 'huaban.com' in hostname or 'huabanimg.com' in hostname:
+            headers.update({
+                'Referer': 'https://huaban.com/',
+                'Origin': 'https://huaban.com',
+                'Pragma': 'no-cache',
+                'Sec-Fetch-Dest': 'image',
+                'Sec-Fetch-Mode': 'no-cors',
+                'Sec-Fetch-Site': 'cross-site',
+            })
+
+        return headers
+
+    def _guess_extension_from_content_type(self, content_type: str) -> Optional[str]:
+        """Infer a filename extension from an image content type."""
+        content_type = (content_type or '').lower()
+        if 'image/png' in content_type:
+            return '.png'
+        if 'image/webp' in content_type:
+            return '.webp'
+        if 'image/gif' in content_type:
+            return '.gif'
+        if 'image/jpeg' in content_type or 'image/jpg' in content_type:
+            return '.jpg'
+        return None
+
+    def _resolve_download_path(self, file_path: Path, image_url: str, content_type: str) -> Path:
+        """Correct the filename suffix when the source URL does not expose one."""
+        url_ext = Path(urlparse(image_url).path).suffix.lower()
+        if url_ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+            return file_path
+
+        inferred_ext = self._guess_extension_from_content_type(content_type)
+        if not inferred_ext or file_path.suffix.lower() == inferred_ext:
+            return file_path
+
+        return file_path.with_suffix(inferred_ext)
     
     def _generate_filename(self, image_url: str, platform: str) -> str:
         """
@@ -212,7 +255,8 @@ class ImageDownloader:
         start_time = time.time()
         
         try:
-            async with self.session.get(url) as response:
+            request_headers = self._build_request_headers(url)
+            async with self.session.get(url, headers=request_headers or None) as response:
                 if response.status != 200:
                     return {
                         'success': False,
@@ -230,7 +274,8 @@ class ImageDownloader:
                 downloaded_size = 0
                 
                 # 创建临时文件
-                temp_file_path = file_path.with_suffix(file_path.suffix + '.tmp')
+                final_file_path = self._resolve_download_path(file_path, url, content_type)
+                temp_file_path = final_file_path.with_suffix(final_file_path.suffix + '.tmp')
                 
                 try:
                     with open(temp_file_path, 'wb') as file:
@@ -255,14 +300,15 @@ class ImageDownloader:
                         }
                     
                     # 重命名临时文件
-                    temp_file_path.rename(file_path)
+                    temp_file_path.rename(final_file_path)
                     
                     download_time = time.time() - start_time
                     
                     return {
                         'success': True,
                         'size': downloaded_size,
-                        'download_time': download_time
+                        'download_time': download_time,
+                        'file_path': str(final_file_path)
                     }
                     
                 except Exception as e:
