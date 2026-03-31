@@ -187,6 +187,21 @@ class GaodingCrawler:
             dom_entries = self._extract_dom_candidates(soup)
             json_entries = self._extract_json_candidates(soup)
             text_entries = self._extract_contextual_urls_from_text(html_content)
+            preview_bundle_entries = self._extract_preview_bundle_from_html(html_content)
+
+            if preview_bundle_entries:
+                valid_urls = await self._validate_urls_in_order(
+                    [image_url for image_url, _ in preview_bundle_entries]
+                )
+                if len(valid_urls) >= 2:
+                    return self._build_result(
+                        valid_urls,
+                        url,
+                        'html-preview-bundle',
+                        'static_html_preview_bundle',
+                        link_type,
+                        score=1900,
+                    )
 
             multi_page_entries = self._select_best_multi_page_group(json_entries)
             if multi_page_entries:
@@ -495,6 +510,57 @@ class GaodingCrawler:
             candidates.append((candidate_url, context))
 
         return candidates
+
+    def _extract_preview_bundle_from_html(self, html_content: str) -> List[CandidateEntry]:
+        decoded_text = html.unescape(html_content or '')
+        if not decoded_text:
+            return []
+
+        primary_url = self._extract_object_url(decoded_text, 'source_preview_info')
+        primary_hint = 'html.source_preview_info.url'
+
+        if not primary_url:
+            primary_url = self._extract_object_url(decoded_text, 'preview_info')
+            primary_hint = 'html.preview_info.url'
+
+        extends_preview_urls = self._extract_array_object_urls(decoded_text, 'extends_previews')
+
+        bundle_entries: List[CandidateEntry] = []
+        if primary_url:
+            bundle_entries.append((primary_url, primary_hint))
+
+        bundle_entries.extend(
+            (image_url, f'html.extends_previews[{index}].url')
+            for index, image_url in enumerate(extends_preview_urls)
+        )
+
+        return self._dedupe_entries(bundle_entries)
+
+    def _extract_object_url(self, text: str, field_name: str) -> Optional[str]:
+        pattern = re.compile(
+            rf'"{re.escape(field_name)}"\s*:\s*\{{.*?"url"\s*:\s*(null|"(?P<url>https?://[^"]+)")',
+            re.IGNORECASE | re.DOTALL,
+        )
+        match = pattern.search(text)
+        if not match:
+            return None
+        return self._normalize_candidate_url(match.group('url'))
+
+    def _extract_array_object_urls(self, text: str, field_name: str) -> List[str]:
+        pattern = re.compile(
+            rf'"{re.escape(field_name)}"\s*:\s*\[(?P<body>.*?)\]',
+            re.IGNORECASE | re.DOTALL,
+        )
+        match = pattern.search(text)
+        if not match:
+            return []
+
+        urls = []
+        for image_url in re.findall(r'"url"\s*:\s*"([^"]+)"', match.group('body'), re.IGNORECASE):
+            normalized_url = self._normalize_candidate_url(image_url)
+            if normalized_url:
+                urls.append(normalized_url)
+        return self._dedupe_urls(urls)
 
     def _select_best_multi_page_group(self, entries: List[CandidateEntry]) -> List[CandidateEntry]:
         grouped_entries: Dict[str, List[CandidateEntry]] = {}

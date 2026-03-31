@@ -6,6 +6,46 @@ from utils.url_parser import URLParser
 
 
 class TestGaodingCrawler:
+    def test_extract_preview_bundle_from_html_uses_preview_and_extends_previews(self):
+        crawler = GaodingCrawler()
+        html_content = """
+        <script>
+        {&quot;preview_info&quot;:{&quot;url&quot;:&quot;https://gdesign-dam-hw.dancf.com/work/preview/page-1.jpg?auth_key=a&quot;},
+         &quot;source_preview_info&quot;:{&quot;url&quot;:null},
+         &quot;extends_previews&quot;:[
+            {&quot;url&quot;:&quot;https://gdesign-dam-hw.dancf.com/work/preview/page-2.jpg?auth_key=b&quot;},
+            {&quot;url&quot;:&quot;https://gdesign-dam-hw.dancf.com/work/preview/page-3.jpg?auth_key=c&quot;}
+         ]}
+        </script>
+        """
+
+        bundle = crawler._extract_preview_bundle_from_html(html_content)
+
+        assert [item[0] for item in bundle] == [
+            "https://gdesign-dam-hw.dancf.com/work/preview/page-1.jpg?auth_key=a",
+            "https://gdesign-dam-hw.dancf.com/work/preview/page-2.jpg?auth_key=b",
+            "https://gdesign-dam-hw.dancf.com/work/preview/page-3.jpg?auth_key=c",
+        ]
+
+    def test_extract_preview_bundle_from_html_prefers_source_preview_info(self):
+        crawler = GaodingCrawler()
+        html_content = """
+        <script>
+        {&quot;preview_info&quot;:{&quot;url&quot;:&quot;https://gdesign-dam-hw.dancf.com/work/preview/page-1-watermark.jpg?auth_key=a&quot;},
+         &quot;source_preview_info&quot;:{&quot;url&quot;:&quot;https://gdesign-dam-hw.dancf.com/work/export/page-1.jpg?auth_key=z&quot;},
+         &quot;extends_previews&quot;:[
+            {&quot;url&quot;:&quot;https://gdesign-dam-hw.dancf.com/work/preview/page-2.jpg?auth_key=b&quot;}
+         ]}
+        </script>
+        """
+
+        bundle = crawler._extract_preview_bundle_from_html(html_content)
+
+        assert [item[0] for item in bundle] == [
+            "https://gdesign-dam-hw.dancf.com/work/export/page-1.jpg?auth_key=z",
+            "https://gdesign-dam-hw.dancf.com/work/preview/page-2.jpg?auth_key=b",
+        ]
+
     def test_candidate_filter_accepts_market_preview_and_blocks_app_assets(self):
         crawler = GaodingCrawler()
 
@@ -180,6 +220,67 @@ class TestGaodingCrawler:
         assert result["isMultiPage"] is True
         assert result["pageCount"] == 2
         assert result["imageUrls"] == [page_one, page_two]
+
+    @pytest.mark.asyncio
+    async def test_static_scraping_builds_multi_page_result_from_html_preview_bundle(self):
+        crawler = GaodingCrawler()
+        page_one = "https://gdesign-dam-hw.dancf.com/work/preview/page-1.jpg?auth_key=a"
+        page_two = "https://gdesign-dam-hw.dancf.com/work/preview/page-2.jpg?auth_key=b"
+        page_three = "https://gdesign-dam-hw.dancf.com/work/preview/page-3.jpg?auth_key=c"
+
+        html_content = f"""
+        <html><head></head><body>
+        <script>
+        {{&quot;preview_info&quot;:{{&quot;url&quot;:&quot;{page_one}&quot;}},
+         &quot;source_preview_info&quot;:{{&quot;url&quot;:null}},
+         &quot;extends_previews&quot;:[
+            {{&quot;url&quot;:&quot;{page_two}&quot;}},
+            {{&quot;url&quot;:&quot;{page_three}&quot;}}
+         ]}}
+        </script>
+        </body></html>
+        """
+
+        async def fake_validate(url):
+            return url in {page_one, page_two, page_three}
+
+        crawler.validator.validate_image_url = fake_validate
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, body):
+                self._body = body
+
+            async def text(self):
+                return self._body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeSession:
+            def __init__(self, body):
+                self._body = body
+
+            def get(self, *args, **kwargs):
+                return FakeResponse(self._body)
+
+        result = await crawler._static_scraping(
+            FakeSession(html_content),
+            "https://www.gaoding.com/dam/share/test",
+            "share",
+        )
+
+        await crawler.close()
+
+        assert result is not None
+        assert result["isMultiPage"] is True
+        assert result["pageCount"] == 3
+        assert result["imageUrls"] == [page_one, page_two, page_three]
+        assert result["method"] == "static_html_preview_bundle"
 
 
 class TestGaodingIntegration:
