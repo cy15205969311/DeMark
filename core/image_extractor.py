@@ -14,6 +14,7 @@ from utils.url_parser import URLParser
 from crawlers.tuguaishou_818ps import Tuguaishou818psCrawler
 from crawlers.canva_crawler import CanvaCrawler
 from crawlers.chuangkit_crawler import ChuangkitCrawler
+from crawlers.gaoding_crawler import GaodingCrawler
 
 class ImageExtractor:
     """
@@ -31,7 +32,8 @@ class ImageExtractor:
         self.crawlers = {
             '818ps': Tuguaishou818psCrawler(),
             'Canva': CanvaCrawler(),
-            'Chuangkit': ChuangkitCrawler()
+            'Chuangkit': ChuangkitCrawler(),
+            'Gaoding': GaodingCrawler()
         }
 
     def _normalize_result_images(self, result: Optional[Dict]) -> Optional[Dict]:
@@ -332,6 +334,8 @@ class ImageExtractor:
                 return await self._extract_canva(url, parsed_params)
             elif platform == 'Chuangkit':
                 return await self._extract_chuangkit(url, parsed_params)
+            elif platform == 'Gaoding':
+                return await self._extract_gaoding(url, parsed_params)
             else:
                 logging.warning(f"⚠️ 不支持的平台: {platform}")
                 return None
@@ -493,7 +497,33 @@ class ImageExtractor:
         except Exception as e:
             logging.error(f"❌ 创客贴提取失败: {e}")
             return None
-    
+
+    async def _extract_gaoding(self, url: str, parsed_params: dict = None) -> Optional[Dict]:
+        """
+        提取稿定设计图片 - 使用专用爬虫
+
+        Args:
+            url: 稿定设计分享页 / 模板页 / 编辑页 URL
+            parsed_params: 预提取参数 (当前暂不使用)
+
+        Returns:
+            提取结果字典或 None
+        """
+        try:
+            logging.info(f"🎯 开始稿定设计本地提取: {url}")
+            del parsed_params
+
+            if 'Gaoding' in self.crawlers:
+                crawler = self.crawlers['Gaoding']
+                return await crawler.extract_image(url)
+
+            logging.warning("❌ 稿定设计爬虫未初始化")
+            return None
+
+        except Exception as e:
+            logging.error(f"❌ 稿定设计提取失败: {e}")
+            return None
+
     async def close(self):
         """关闭资源"""
         await self._cleanup()

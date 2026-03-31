@@ -4,7 +4,7 @@ URL解析工具 - 处理各种分享链接格式
 """
 import re
 import requests
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlunparse
 from typing import Dict, Optional, Tuple
 import logging
 import time
@@ -71,6 +71,8 @@ class URLParser:
                 return self._parse_canva_share_url(clean_url, url)
             elif platform == "Chuangkit":
                 return self._parse_chuangkit_share_url(clean_url, url)
+            elif platform == "Gaoding":
+                return self._parse_gaoding_share_url(clean_url, url)
             else:
                 # 尝试直接使用原URL
                 return {
@@ -334,6 +336,8 @@ class URLParser:
             return 'Canva'
         elif 'chuangkit.com' in url_lower or 'chuangkit.cn' in url_lower:
             return 'Chuangkit'
+        elif 'gaoding.com' in url_lower or 'gaoding.cn' in url_lower:
+            return 'Gaoding'
         else:
             return 'Unknown'
     
@@ -401,6 +405,18 @@ class URLParser:
             'original_url': original_url,
             'parsed_url': url,
             'platform': 'Chuangkit',
+            'type': 'direct'
+        }
+
+    def _parse_gaoding_share_url(self, url: str, original_url: str) -> Dict:
+        """解析稿定设计分享链接"""
+        parsed_url = urlparse(url)
+        cleaned_url = urlunparse(parsed_url._replace(fragment=''))
+        return {
+            'success': True,
+            'original_url': original_url,
+            'parsed_url': cleaned_url,
+            'platform': 'Gaoding',
             'type': 'direct'
         }
     

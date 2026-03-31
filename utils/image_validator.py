@@ -133,6 +133,9 @@ class ImageValidator:
             elif 'chuangkit.com' in hostname:
                 headers['Referer'] = 'https://www.chuangkit.com/'
                 headers['Origin'] = 'https://www.chuangkit.com'
+            elif 'gaoding.com' in hostname or 'gaoding.cn' in hostname or 'dancf.com' in hostname:
+                headers['Referer'] = 'https://www.gaoding.com/'
+                headers['Origin'] = 'https://www.gaoding.com'
             elif '818ps.com' in hostname:
                 headers['Referer'] = 'https://818ps.com/'
                 headers['Origin'] = 'https://818ps.com'
