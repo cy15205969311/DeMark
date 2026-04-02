@@ -120,6 +120,9 @@ class ImageExtractor:
             if platform == 'Huaban':
                 logging.info("📡 阶段1: Huaban使用官方公开接口，跳过第三方API网关")
                 api_result = None
+            elif platform == '818ps' and parse_result.get('type') == 'share_shell':
+                logging.info("📡 阶段1: 818ps /u/ 分享壳页优先走本地渲染提取，跳过第三方API网关")
+                api_result = None
             else:
                 logging.info("📡 阶段1: 尝试第三方API网关...")
                 api_result = await self.third_party_api.extract_with_cache(processed_url, platform)
@@ -299,7 +302,12 @@ class ImageExtractor:
         if not src or not src.startswith('http'):
             return False
         
-        exclude_keywords = ['favicon', 'sprite', 'icon', 'avatar', 'tracking', 'ad']
+        exclude_keywords = [
+            'favicon', 'sprite', 'icon', 'avatar', 'tracking', 'ad',
+            'qrcode', 'wechat_qrcode', 'vx-code', 'xcx-code',
+            'index_hot_day', 'new-index/', 'editor/image/',
+            'topcard', 'blur', 'label_lg_'
+        ]
         return not any(keyword in src.lower() for keyword in exclude_keywords)
     
     def _score_selenium_image(self, url: str, size: int, platform: str) -> int:
@@ -312,7 +320,12 @@ class ImageExtractor:
         
         # 通用加权
         prefer_keys = ['preview', 'cover', 'main', 'banner', 'poster', 'detail', 'work', 'showimg', 'l2000', 'l3000', 'origin', 'big']
-        exclude_keys = ['favicon', 'sprite', 'icon', 'avatar', 'tracking', 'thumb', 'small', 'min', 'svg', 'watermark']
+        exclude_keys = [
+            'favicon', 'sprite', 'icon', 'avatar', 'tracking',
+            'thumb', 'small', 'min', 'svg', 'watermark',
+            'qrcode', 'wechat_qrcode', 'vx-code', 'xcx-code',
+            'index_hot_day', 'new-index/'
+        ]
         
         if any(key in url_lower for key in prefer_keys):
             score += 200
@@ -327,6 +340,14 @@ class ImageExtractor:
                 score -= 320
             if any(pattern in url_lower for pattern in ['designer_upload_asset', 'element', 'asset']):
                 score -= 350
+            if any(pattern in url_lower for pattern in ['editor/image/', 'new-index/', 'topcard', 'blur', 'label_lg_']):
+                score -= 500
+            if not any(
+                pattern in url_lower
+                for pattern in ['img.tuguaishou.com', 'img.818ps.com', 'cdn.818ps.com', 'static.818ps.com',
+                                'user_preview_ue', 'user_preview', 'user_work', '/works/']
+            ):
+                score -= 450
             if url_lower.endswith('.jpg'):
                 score += 80
             elif url_lower.endswith('.png'):

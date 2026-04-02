@@ -7,6 +7,7 @@ import os
 import sys
 import re
 import subprocess
+import tempfile
 from typing import Optional, Dict, List, Any
 import time
 
@@ -36,7 +37,126 @@ class BrowserService:
         
         logging.warning("⚠️ 未找到Chrome浏览器")
         return None
-    
+
+    def dump_dom_with_local_chrome(
+        self,
+        url: str,
+        virtual_time_budget_ms: int = 12000,
+        timeout_seconds: int = 40
+    ) -> Optional[str]:
+        """
+        直接调用本机 Chrome 输出渲染后的 DOM。
+
+        这条路径不依赖 chromedriver，适合在动态页静态源码不够、
+        但又不希望把成功率完全压在 Selenium 上时使用。
+        """
+        chrome_path = self._find_chrome_executable()
+        if not chrome_path:
+            logging.warning("⚠️ 无法执行本地Chrome渲染：未找到Chrome浏览器")
+            return None
+
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        temp_output = tempfile.NamedTemporaryFile(
+            prefix=f"demark_chrome_dump_{os.getpid()}_{int(time.time() * 1000)}_",
+            suffix=".html",
+            delete=False
+        )
+        output_path = temp_output.name
+        temp_output.close()
+
+        command = [
+            chrome_path,
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--hide-scrollbars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-popup-blocking",
+            "--run-all-compositor-stages-before-draw",
+            f"--virtual-time-budget={int(virtual_time_budget_ms)}",
+            "--window-size=1600,3200",
+            "--dump-dom",
+            url,
+        ]
+
+        try:
+            logging.info(f"🌐 使用本地Chrome渲染DOM: {url}")
+            if os.name == "nt":
+                def ps_quote(value: str) -> str:
+                    return "'" + value.replace("'", "''") + "'"
+
+                argument_list = "@(" + ",".join(
+                    ps_quote(argument) for argument in command[1:]
+                ) + ")"
+                script = (
+                    f"$p = Start-Process -FilePath {ps_quote(command[0])} "
+                    f"-ArgumentList {argument_list} "
+                    f"-RedirectStandardOutput {ps_quote(output_path)} "
+                    f"-Wait -PassThru; "
+                    f"exit $p.ExitCode"
+                )
+                completed = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        script,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout_seconds + 10,
+                    creationflags=creation_flags,
+                    check=False,
+                )
+            else:
+                with open(output_path, "w", encoding="utf-8", errors="ignore") as output_file:
+                    completed = subprocess.run(
+                        command,
+                        stdout=output_file,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        encoding="utf-8",
+                        errors="ignore",
+                        timeout=timeout_seconds,
+                        creationflags=creation_flags,
+                        check=False,
+                    )
+        except subprocess.TimeoutExpired:
+            logging.warning("⚠️ 本地Chrome渲染DOM超时")
+            return None
+        except Exception as error:
+            logging.warning(f"⚠️ 本地Chrome渲染DOM失败: {error}")
+            return None
+
+        try:
+            with open(output_path, "r", encoding="utf-8", errors="ignore") as output_file:
+                dom_content = output_file.read().strip()
+        except Exception as error:
+            logging.warning(f"⚠️ 读取本地Chrome渲染DOM失败: {error}")
+            return None
+        finally:
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            except OSError:
+                pass
+
+        if completed.returncode != 0:
+            logging.warning(
+                f"⚠️ 本地Chrome渲染DOM返回异常退出码: {completed.returncode}"
+            )
+
+        if not dom_content or "<html" not in dom_content.lower():
+            logging.warning("⚠️ 本地Chrome未输出有效DOM内容")
+            return None
+
+        logging.info(f"✅ 本地Chrome渲染DOM成功 ({len(dom_content)} 字符)")
+        return dom_content
+
     def _get_chrome_version(self) -> Optional[int]:
         """
         获取本地Chrome浏览器的主版本号
@@ -547,6 +667,37 @@ class BrowserService:
                 return match ? parseInt(match[1], 10) : null;
             }
 
+            function getPageMarkerElements() {
+                var markers = [];
+                Array.from(document.querySelectorAll('*')).forEach(function(el) {
+                    try {
+                        if (!isVisible(el)) return;
+
+                        var rawText = String(el.innerText || el.textContent || '').trim();
+                        if (!rawText) return;
+
+                        var page = extractPage(rawText);
+                        if (!page) {
+                            var prefixMatch = rawText.match(/^第\\s*(\\d+)\\s*页/);
+                            if (prefixMatch) {
+                                page = parseInt(prefixMatch[1], 10);
+                            }
+                        }
+
+                        if (!page) return;
+
+                        markers.push({
+                            page: page,
+                            label: '\\u7b2c' + page + '\\u9875',
+                            el: el
+                        });
+                    } catch (e) {}
+                });
+
+                markers.sort(function(a, b) { return a.page - b.page; });
+                return markers;
+            }
+
             function isVisible(el) {
                 if (!el) return false;
                 var rect = el.getBoundingClientRect();
@@ -555,49 +706,87 @@ class BrowserService:
 
             function findClickable(el) {
                 var current = el;
-                var fallback = el;
+                var best = null;
+                var bestScore = -1000000;
+
+                function scoreElement(node) {
+                    try {
+                        if (!isVisible(node)) return -1000000;
+
+                        var rect = node.getBoundingClientRect();
+                        var area = Math.max(rect.width || 0, 0) * Math.max(rect.height || 0, 0);
+                        var style = window.getComputedStyle(node);
+                        var className = String(node.className || '');
+                        var text = normalizeText(node.innerText || node.textContent || '');
+                        var score = 0;
+
+                        if (
+                            node.tagName === 'BUTTON' ||
+                            node.tagName === 'A' ||
+                            node.getAttribute('role') === 'button' ||
+                            node.tabIndex >= 0 ||
+                            typeof node.onclick === 'function' ||
+                            (style.cursor || '').indexOf('pointer') >= 0
+                        ) {
+                            score += 260;
+                        }
+
+                        if (/page|thumb|item|card|preview|cover|list|nav|panel|switch/i.test(className)) {
+                            score += 140;
+                        }
+
+                        if (text.indexOf(targetPage.toString()) >= 0 && text.indexOf('\\u9875') >= 0) {
+                            score += 180;
+                        }
+
+                        if (node === el) {
+                            score += 120;
+                        }
+
+                        if (node.tagName === 'HTML' || node.tagName === 'BODY') {
+                            score -= 500;
+                        }
+
+                        if (/render-core|rootLayout|root/i.test(className)) {
+                            score -= 260;
+                        }
+
+                        if (area <= 0) {
+                            score -= 300;
+                        } else if (area <= 200000) {
+                            score += 80;
+                        } else if (area <= 600000) {
+                            score += 20;
+                        } else {
+                            score -= 180;
+                        }
+
+                        if (rect.width <= 420 && rect.height <= 420) {
+                            score += 50;
+                        }
+
+                        return score;
+                    } catch (e) {
+                        return -1000000;
+                    }
+                }
+
                 for (var depth = 0; current && depth < 6; depth += 1) {
                     try {
-                        if (isVisible(current)) fallback = current;
-
-                        var style = window.getComputedStyle(current);
-                        var className = String(current.className || '');
-                        var clickable =
-                            current.tagName === 'BUTTON' ||
-                            current.tagName === 'A' ||
-                            current.getAttribute('role') === 'button' ||
-                            current.tabIndex >= 0 ||
-                            typeof current.onclick === 'function' ||
-                            (style.cursor || '').indexOf('pointer') >= 0 ||
-                            /page|thumb|item|card|preview|cover|list/i.test(className);
-
-                        if (clickable && isVisible(current)) {
-                            return current;
+                        var score = scoreElement(current);
+                        if (score > bestScore) {
+                            best = current;
+                            bestScore = score;
                         }
                     } catch (e) {}
 
                     current = current.parentElement;
                 }
 
-                return fallback;
+                return best || el;
             }
 
-            var markers = [];
-            Array.from(document.querySelectorAll('*')).forEach(function(el) {
-                try {
-                    if (!isVisible(el)) return;
-                    var page = extractPage(el.innerText || el.textContent || '');
-                    if (!page) return;
-
-                    markers.push({
-                        page: page,
-                        label: '\\u7b2c' + page + '\\u9875',
-                        el: el
-                    });
-                } catch (e) {}
-            });
-
-            markers.sort(function(a, b) { return a.page - b.page; });
+            var markers = getPageMarkerElements();
             var marker = markers.find(function(item) { return item.page === targetPage; });
             if (!marker) {
                 return {
@@ -605,7 +794,7 @@ class BrowserService:
                     label: targetLabel,
                     clicked: false,
                     reason: 'marker_not_found',
-                    availablePages: markers.map(function(item) { return item.label; })
+                    availablePages: Array.from(new Set(markers.map(function(item) { return item.label; })))
                 };
             }
 
@@ -672,7 +861,9 @@ class BrowserService:
                 reason: clicked ? 'clicked' : 'no_click_effect',
                 targetTag: target.tagName || '',
                 targetClass: String(target.className || ''),
-                availablePages: markers.map(function(item) { return item.label; })
+                targetWidth: Math.round(rect.width || 0),
+                targetHeight: Math.round(rect.height || 0),
+                availablePages: Array.from(new Set(markers.map(function(item) { return item.label; })))
             };
         """, page_number)
 
@@ -1111,7 +1302,18 @@ class BrowserService:
             # 等待动态内容加载
             time.sleep(5)  # 增加等待时间
 
-            page_data: Dict[str, Any] = {}
+            resolved_url = None
+            try:
+                resolved_url = driver.current_url
+            except Exception:
+                resolved_url = None
+
+            page_data: Dict[str, Any] = {
+                'requestedUrl': url,
+                'currentUrl': resolved_url or url,
+            }
+            if resolved_url and resolved_url != url:
+                page_data['resolvedUrl'] = resolved_url
             page_data = self._merge_dynamic_capture(page_data, self._capture_dynamic_snapshot(driver))
 
             previous_image_count = len(page_data.get('imageUrls', []))
@@ -1201,7 +1403,18 @@ class BrowserService:
 
             page_data['pageSnapshots'] = page_snapshots
             page_data['pageSpecificImages'] = self._dedupe_keep_order(page_specific_images)
-            
+
+            try:
+                final_current_url = driver.current_url
+            except Exception:
+                final_current_url = None
+
+            if isinstance(final_current_url, str) and final_current_url.strip():
+                final_current_url = final_current_url.strip()
+                page_data['currentUrl'] = final_current_url
+                if final_current_url != url:
+                    page_data['resolvedUrl'] = final_current_url
+
             logging.info(f"✅ 动态内容提取完成")
             logging.info(f"   JSON数据块: {len(page_data.get('jsonData', []))} 个")
             logging.info(f"   图片URL: {len(page_data.get('imageUrls', []))} 个")
@@ -1417,6 +1630,57 @@ class BrowserService:
                 except:
                     pass
     
+    def resolve_url_with_browser(
+        self,
+        url: str,
+        headless: bool = True,
+        wait_seconds: float = 5.0
+    ) -> Optional[str]:
+        """
+        Resolve the final in-browser URL for dynamic share-shell pages such as
+        818ps `/u/` links that only reveal `share_id` after the editor boots.
+        """
+        driver = None
+        try:
+            logging.info(f"🌐 使用本地浏览器解析最终地址: {url}")
+            driver = self._get_stealth_driver(headless=headless)
+            driver.get(url)
+            time.sleep(max(wait_seconds, 0))
+
+            resolved_url = None
+            try:
+                resolved_url = driver.current_url
+            except Exception:
+                resolved_url = None
+
+            if not resolved_url:
+                try:
+                    resolved_url = driver.execute_script(
+                        "return window.location.href || location.href || '';"
+                    )
+                except Exception:
+                    resolved_url = None
+
+            if isinstance(resolved_url, str):
+                resolved_url = resolved_url.strip()
+
+            if resolved_url:
+                logging.info(f"✅ 浏览器最终地址: {resolved_url}")
+                return resolved_url
+
+            logging.warning("⚠️ 浏览器未返回有效的最终地址")
+            return None
+        except Exception as error:
+            logging.warning(f"⚠️ 浏览器解析最终地址失败: {error}")
+            return None
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                    logging.info("✅ Chrome驱动已关闭")
+                except Exception:
+                    pass
+
     def check_chrome_installation(self) -> dict:
         """
         检查Chrome安装状态

@@ -133,6 +133,107 @@ class Tuguaishou818psCrawler:
         counts = [count for count in counts if count > 0]
         return max(counts, default=0)
 
+    def _build_share_preview_first_page_candidate(self, url: str) -> Optional[str]:
+        normalized_url = self._normalize_dynamic_candidate_url(url)
+        if not normalized_url:
+            return None
+
+        match = re.match(
+            r'^(.*?_\d+)_1(\.(?:jpg|jpeg|png|webp))(.*)$',
+            normalized_url,
+            re.IGNORECASE
+        )
+        if not match:
+            return None
+
+        return f"{match.group(1)}{match.group(2)}{match.group(3)}"
+
+    def _augment_share_preview_group(self, urls: List[str], expected_page_count: int) -> List[str]:
+        normalized_urls = self._normalize_share_preview_group(urls)
+        if not normalized_urls:
+            return []
+
+        if expected_page_count != len(normalized_urls) + 1:
+            return normalized_urls
+
+        inferred_pages: List[int] = []
+        for preview_url in normalized_urls:
+            page_number = self._extract_url_page_number(preview_url) or self._extract_818ps_preview_page_number(preview_url)
+            if page_number is None:
+                return normalized_urls
+            inferred_pages.append(page_number)
+
+        if inferred_pages != list(range(2, len(normalized_urls) + 2)):
+            return normalized_urls
+
+        first_page_candidate = self._build_share_preview_first_page_candidate(normalized_urls[0])
+        if not first_page_candidate:
+            return normalized_urls
+
+        return self._sort_urls_by_page_token(
+            self._dedupe_keep_order([first_page_candidate] + normalized_urls)
+        )
+
+    def _build_818ps_variant_candidates(self, image_url: str, prefer_variants: bool = False) -> List[str]:
+        normalized_url = self._normalize_dynamic_candidate_url(image_url)
+        if not normalized_url:
+            return []
+
+        variants = [
+            self._normalize_dynamic_candidate_url(variant)
+            for variant in self.variant_builder.build_818ps_variants(normalized_url)
+        ]
+        variants = [variant for variant in variants if variant]
+
+        ordered_candidates = variants + [normalized_url] if prefer_variants else [normalized_url] + variants
+        return self._dedupe_keep_order(ordered_candidates)
+
+    async def _resolve_818ps_entry_url(self, image_url: str, prefer_variants: bool = False) -> Optional[str]:
+        normalized_url = self._normalize_dynamic_candidate_url(image_url)
+        if not normalized_url:
+            return None
+
+        for candidate_url in self._build_818ps_variant_candidates(normalized_url, prefer_variants=prefer_variants):
+            if await self.validator.validate_image_url(candidate_url):
+                if candidate_url != normalized_url:
+                    logging.info(f"✅ 818ps 分享页已命中去水印候选: {candidate_url}")
+                return candidate_url
+
+        return None
+
+    async def _resolve_818ps_image_entry_urls(self, entries: List[Dict], prefer_variants: bool = False) -> List[str]:
+        if not entries:
+            return []
+
+        results = await asyncio.gather(
+            *(
+                self._resolve_818ps_entry_url(entry.get('url'), prefer_variants=prefer_variants)
+                for entry in entries
+            ),
+            return_exceptions=True
+        )
+
+        valid_urls: List[str] = []
+        seen = set()
+        for resolved_url in results:
+            if isinstance(resolved_url, Exception):
+                continue
+
+            normalized_url = self._normalize_dynamic_candidate_url(resolved_url)
+            if normalized_url and normalized_url not in seen:
+                valid_urls.append(normalized_url)
+                seen.add(normalized_url)
+
+        return self._sort_urls_by_page_token(valid_urls)
+
+    def _share_api_source_priority(self, source_name: str) -> int:
+        priorities = {
+            'share_template': 3,
+            'get_template_page_data': 2,
+            'team_share_get_templ': 1,
+        }
+        return priorities.get(source_name, 0)
+
     def _normalize_share_preview_group(self, urls: List[str]) -> List[str]:
         """规范化并过滤分享 API 返回的设计稿预览。"""
         normalized_urls: List[str] = []
@@ -148,7 +249,7 @@ class Tuguaishou818psCrawler:
             normalized_urls.append(candidate_url)
             seen.add(candidate_url)
 
-        return normalized_urls
+        return self._sort_urls_by_page_token(normalized_urls)
 
     def _extract_share_api_preview_groups(self, payloads: Dict[str, Dict]) -> Tuple[List[Tuple[str, List[str]]], int]:
         """按优先级抽取分享 API 中的多页设计稿 URL。"""
@@ -156,7 +257,7 @@ class Tuguaishou818psCrawler:
         expected_page_count = self._extract_expected_page_count_from_share_api_payloads(payloads)
 
         def add_group(source: str, raw_urls: List[str]) -> None:
-            normalized_urls = self._normalize_share_preview_group(raw_urls)
+            normalized_urls = self._augment_share_preview_group(raw_urls, expected_page_count)
             if normalized_urls:
                 groups.append((source, normalized_urls))
 
@@ -241,6 +342,9 @@ class Tuguaishou818psCrawler:
         if not preview_groups:
             return None
 
+        best_result: Optional[Dict] = None
+        best_result_rank = (-1, -1, -1)
+
         for source_name, candidate_urls in preview_groups:
             entries = [
                 {
@@ -250,22 +354,40 @@ class Tuguaishou818psCrawler:
                 }
                 for candidate_url in candidate_urls
             ]
-            valid_urls = await self._validate_image_entry_urls(entries)
+            valid_urls = await self._resolve_818ps_image_entry_urls(entries, prefer_variants=True)
             if not valid_urls:
                 continue
 
-            enough_pages = expected_page_count <= 1 or len(valid_urls) >= expected_page_count
-            if enough_pages or len(valid_urls) > 1:
+            result = self._build_multi_image_result(
+                valid_urls,
+                url,
+                f'share_api_{source_name}',
+                max((entry['score'] for entry in entries), default=0)
+            )
+            result_rank = (
+                1 if expected_page_count <= 1 or len(valid_urls) >= expected_page_count else 0,
+                len(valid_urls),
+                self._share_api_source_priority(source_name),
+            )
+
+            if result_rank > best_result_rank:
+                best_result = result
+                best_result_rank = result_rank
+
+            if result_rank[0]:
                 logging.info(
                     f"✅ 官方分享API提取成功: source={source_name}, "
                     f"pages={len(valid_urls)}, expected={expected_page_count or len(valid_urls)}"
                 )
-                return self._build_multi_image_result(
-                    valid_urls,
-                    url,
-                    f'share_api_{source_name}',
-                    max((entry['score'] for entry in entries if entry['url'] in valid_urls), default=0)
+                return result
+
+        if best_result:
+            if expected_page_count > 1 and best_result.get('pageCount', 0) < expected_page_count:
+                logging.warning(
+                    f"⚠️ 官方分享API仅拿到部分页面: source={best_result.get('source')}, "
+                    f"pages={best_result.get('pageCount', 0)}, expected={expected_page_count}"
                 )
+            return best_result
 
         if expected_page_count > 1:
             logging.warning(
@@ -602,7 +724,90 @@ class Tuguaishou818psCrawler:
             
         except Exception:
             return False, 0
-    
+
+    def _is_dynamic_like_page(self, url: str) -> bool:
+        """
+        判断当前 URL 是否更像需要渲染后的分享/编辑器页面。
+        """
+        url_lower = (url or '').lower()
+        return (
+            'ue.818ps.com' in url_lower or
+            'tuguaishou.com' in url_lower or
+            '818ps.com/u/' in url_lower
+        )
+
+    async def _extract_from_html_content(
+        self,
+        html_content: str,
+        url: str,
+        source_label: str
+    ) -> Optional[Dict]:
+        """
+        统一执行 HTML 内容提取链路，便于静态源码和渲染后 DOM 复用同一套解析逻辑。
+        """
+        if not html_content:
+            return None
+
+        logging.info(f"📄 {source_label}: 获取页面内容 {len(html_content)} 字符")
+
+        extractors = [
+            ("Meta标签提取", self._extract_meta_image_from_html),
+            ("JSON深度提取", self._extract_json_data),
+            ("源码正则回退", self._extract_with_regex_fallback),
+            ("JavaScript变量提取", self._extract_from_js_variables),
+            ("BeautifulSoup解析", self._extract_with_beautifulsoup),
+        ]
+
+        for extractor_name, extractor in extractors:
+            logging.info(f"🔍 {source_label}: 尝试{extractor_name}...")
+            result = await extractor(html_content, url)
+            if result:
+                logging.info(f"✅ {source_label}: {extractor_name}成功")
+                return result
+
+        return None
+
+    async def _render_page_with_local_chrome_legacy(self, url: str) -> Optional[str]:
+        """
+        使用本机 Chrome 渲染页面并导出 DOM。
+
+        这条路径不依赖 chromedriver，适合作为动态页的轻量回退。
+        """
+        try:
+            from core.browser_service import BrowserService
+
+            browser_service = BrowserService()
+
+            initial_share_params = self._extract_share_query_params(url)
+            needs_share_resolution = (
+                '818ps.com/u/' in (url or '').lower()
+                and not initial_share_params.get('share_id')
+            )
+
+            if needs_share_resolution:
+                resolved_url = await asyncio.to_thread(
+                    browser_service.resolve_url_with_browser,
+                    url
+                )
+                if resolved_url:
+                    resolved_share_params = self._extract_share_query_params(resolved_url)
+                    if resolved_share_params.get('share_id'):
+                        logging.info(
+                            "🔗 818ps 分享壳页已解析到编辑器地址，优先回退官方分享 API: "
+                            f"{resolved_url}"
+                        )
+                        share_api_result = await self._extract_from_share_api(resolved_url)
+                        if share_api_result:
+                            logging.info("✅ 浏览器解析后的编辑器地址命中官方分享 API")
+                            return share_api_result
+            return await asyncio.to_thread(
+                browser_service.dump_dom_with_local_chrome,
+                url
+            )
+        except Exception as error:
+            logging.warning(f"⚠️ 本地Chrome渲染DOM失败: {error}")
+            return None
+
     async def _scrape_webpage_enhanced(self, url: str) -> Optional[Dict]:
         """
         增强版网页抓取 - 核心改进
@@ -610,10 +815,11 @@ class Tuguaishou818psCrawler:
         """
         try:
             logging.info(f"🌐 开始增强版网页抓取: {url}")
+            await self._ensure_session()
             
             # 检查是否为动态渲染页面
-            if 'ue.818ps.com' in url or 'tuguaishou.com' in url:
-                logging.info("🔍 检测到动态渲染页面，启用JSON深度提取...")
+            if self._is_dynamic_like_page(url):
+                logging.info("🔍 检测到动态/分享壳页面，启用静态HTML + 渲染DOM回退...")
                 return await self._extract_dynamic_page(url)
             
             # 获取页面内容 (静态页面)
@@ -623,42 +829,18 @@ class Tuguaishou818psCrawler:
                     return None
                 
                 html_content = await response.text()
-                logging.info(f"📄 获取页面内容: {len(html_content)} 字符")
-            
-            # 方法1: JSON深度提取 (新增)
-            logging.info("🔍 尝试JSON深度提取...")
-            result = await self._extract_json_data(html_content, url)
-            if result:
-                logging.info("✅ JSON深度提取成功")
-                return result
-            
-            # 方法2: BeautifulSoup解析 (结构化方法)
-            result = await self._extract_with_beautifulsoup(html_content, url)
-            if result:
-                logging.info("✅ BeautifulSoup解析成功")
-                return result
-            
-            # 方法3: 源码正则回退机制 (核心增强)
-            logging.info("🔍 启动源码正则回退机制...")
-            result = await self._extract_with_regex_fallback(html_content, url)
-            if result:
-                logging.info("✅ 正则回退机制成功")
-                return result
-            
-            # 方法4: JavaScript变量提取
-            logging.info("🔍 尝试JavaScript变量提取...")
-            result = await self._extract_from_js_variables(html_content, url)
-            if result:
-                logging.info("✅ JavaScript变量提取成功")
-                return result
-            
-            return None
+
+            return await self._extract_from_html_content(
+                html_content,
+                url,
+                '静态HTML'
+            )
             
         except Exception as e:
             logging.error(f"❌ 增强版网页抓取失败: {e}")
             return None
     
-    async def _extract_dynamic_page(self, url: str) -> Optional[Dict]:
+    async def _extract_dynamic_page_legacy(self, url: str) -> Optional[Dict]:
         """
         提取动态渲染页面 - 使用浏览器服务
         """
@@ -690,34 +872,39 @@ class Tuguaishou818psCrawler:
         动态页的轻量回退方案
         浏览器启动失败时，仍然尝试用静态HTML提取可用信息
         """
+        html_content: Optional[str] = None
+
         try:
             await self._ensure_session()
             async with self.session.get(url, timeout=15) as response:
                 if response.status != 200:
                     logging.warning(f"⚠️ 动态页静态抓取失败，响应码: {response.status}")
-                    return None
-
-                html_content = await response.text()
-                logging.info(f"📄 动态页静态源码获取成功 ({len(html_content)} 字符)")
-
-            extractors = [
-                self._extract_meta_image_from_html,
-                self._extract_json_data,
-                self._extract_with_regex_fallback,
-                self._extract_with_beautifulsoup,
-            ]
-
-            for extractor in extractors:
-                result = await extractor(html_content, url)
-                if result:
-                    logging.info(f"✅ 动态页静态回退成功: {extractor.__name__}")
-                    return result
-
-            return None
-
+                else:
+                    html_content = await response.text()
+                    logging.info(f"📄 动态页静态源码获取成功 ({len(html_content)} 字符)")
         except Exception as e:
             logging.warning(f"⚠️ 动态页静态回退失败: {e}")
-            return None
+
+        if html_content:
+            result = await self._extract_from_html_content(
+                html_content,
+                url,
+                '动态页静态源码'
+            )
+            if result:
+                return result
+
+        rendered_dom = await self._render_page_with_local_chrome(url)
+        if rendered_dom:
+            result = await self._extract_from_html_content(
+                rendered_dom,
+                url,
+                '本地Chrome渲染DOM'
+            )
+            if result:
+                return result
+
+        return None
     
     async def _analyze_dynamic_data(self, dynamic_data: dict, url: str) -> Optional[Dict]:
         """
@@ -733,6 +920,51 @@ class Tuguaishou818psCrawler:
             page_specific_urls = await self._extract_page_specific_image_urls(dynamic_data)
             if page_specific_urls:
                 logging.info(f"📄 逐页激活提取到设计稿页面: {len(page_specific_urls)}")
+                if len(page_specific_urls) > 1:
+                    return self._build_multi_image_result(
+                        page_specific_urls,
+                        url,
+                        'dynamic_page_activation',
+                        max(
+                            (
+                                self._score_dynamic_image(image_url, 'page_specific')
+                                for image_url in page_specific_urls
+                            ),
+                            default=0
+                        )
+                    )
+
+            structured_groups: List[Dict] = []
+            for json_block in dynamic_data.get('jsonData', []) or []:
+                self._collect_preview_groups_from_data(json_block, 'browser.json', structured_groups)
+
+            for window_name, window_block in (dynamic_data.get('windowData') or {}).items():
+                self._collect_preview_groups_from_data(
+                    window_block,
+                    f'browser.window.{window_name}',
+                    structured_groups
+                )
+
+            for group in structured_groups:
+                entries = [
+                    {
+                        'url': candidate_url,
+                        'source': 'json',
+                        'score': self._score_dynamic_image(candidate_url, 'json')
+                    }
+                    for candidate_url in group.get('urls', [])
+                ]
+                valid_urls = await self._validate_image_entry_urls(entries)
+                if len(valid_urls) > 1:
+                    logging.info(
+                        f"🧩 结构化数据提取到多页结果: source={group.get('source')}, pages={len(valid_urls)}"
+                    )
+                    return self._build_multi_image_result(
+                        valid_urls,
+                        url,
+                        f"dynamic_structured_{group.get('source')}",
+                        max((entry['score'] for entry in entries if entry['url'] in valid_urls), default=0)
+                    )
 
             candidate_entries = self._collect_dynamic_image_candidates(dynamic_data)
             if not candidate_entries:
@@ -874,6 +1106,176 @@ class Tuguaishou818psCrawler:
         walk(data)
         return image_urls
 
+    def _extract_preview_urls_from_array(self, items) -> List[str]:
+        """从结构化数组中提取预览图候选 URL。"""
+        preview_fields = [
+            'origin_img', 'originImg',
+            'big_img', 'bigImg',
+            'img', 'image', 'imageUrl', 'image_url',
+            'preview', 'previewUrl', 'preview_url',
+            'url', 'src',
+            'cover', 'coverUrl', 'cover_url',
+            'user_preview_ue', 'user_preview',
+        ]
+
+        urls: List[str] = []
+        for item in items or []:
+            if isinstance(item, str):
+                urls.append(item)
+                continue
+
+            if not isinstance(item, dict):
+                continue
+
+            for field in preview_fields:
+                value = item.get(field)
+                if isinstance(value, str):
+                    urls.append(value)
+
+            nested_url = item.get('url')
+            if isinstance(nested_url, dict):
+                for field in preview_fields:
+                    value = nested_url.get(field)
+                    if isinstance(value, str):
+                        urls.append(value)
+
+        return urls
+
+    def _normalize_preview_group_urls(self, urls: List[str]) -> List[str]:
+        """规范化并过滤结构化预览数组中的设计稿 URL。"""
+        normalized_urls = self._dedupe_keep_order(
+            self._normalize_dynamic_candidate_url(url)
+            for url in urls or []
+        )
+        return self._sort_urls_by_page_token([
+            url for url in normalized_urls
+            if self._is_design_page_candidate(url)
+        ])
+
+    def _collect_preview_groups_from_data(
+        self,
+        data,
+        source: str = 'data',
+        groups: Optional[List[Dict]] = None
+    ) -> List[Dict]:
+        """递归收集 jsonData / windowData 中的多页预览数组。"""
+        if groups is None:
+            groups = []
+
+        if not data:
+            return groups
+
+        if isinstance(data, list):
+            group_urls = self._normalize_preview_group_urls(
+                self._extract_preview_urls_from_array(data)
+            )
+            if len(group_urls) > 1:
+                groups.append({
+                    'source': source,
+                    'urls': group_urls,
+                })
+
+            for index, item in enumerate(data):
+                self._collect_preview_groups_from_data(item, f'{source}[{index}]', groups)
+            return groups
+
+        if not isinstance(data, dict):
+            return groups
+
+        for key, value in data.items():
+            if isinstance(value, list):
+                group_urls = self._normalize_preview_group_urls(
+                    self._extract_preview_urls_from_array(value)
+                )
+                if len(group_urls) > 1:
+                    groups.append({
+                        'source': f'{source}.{key}',
+                        'urls': group_urls,
+                    })
+
+            self._collect_preview_groups_from_data(value, f'{source}.{key}', groups)
+
+        return groups
+
+    def _extract_url_page_number(self, url: str) -> Optional[int]:
+        """尝试从 URL 本身推断页码。"""
+        if not isinstance(url, str):
+            return None
+
+        patterns = [
+            r'(?:^|[\/_-])page[_-]?(\d+)(?:[._!?-]|$)',
+            r'(?:^|[\/_-])p[_-]?(\d+)(?:[._!?-]|$)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, url, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+
+        return None
+
+    def _extract_818ps_preview_page_number(self, url: str) -> Optional[int]:
+        """从 818ps user_preview_ue 这类文件名推断页码。"""
+        if not isinstance(url, str):
+            return None
+
+        try:
+            parsed_url = urlparse(url)
+            path = str(parsed_url.path or '')
+            lower_path = path.lower()
+            if not any(segment in lower_path for segment in [
+                '/user_preview_ue/',
+                '/user_preview/',
+                '/user_work/',
+                '/works/',
+            ]):
+                return None
+
+            filename = path.split('/')[-1] if path else ''
+            filename = filename.split('!', 1)[0]
+            match = re.match(
+                r'^(.+?_\d+)(?:_(\d+))?\.(?:jpg|jpeg|png|webp)$',
+                filename,
+                re.IGNORECASE
+            )
+            if not match:
+                return None
+
+            return int(match.group(2)) + 1 if match.group(2) else 1
+        except Exception:
+            return None
+
+    def _sort_urls_by_page_token(self, urls: List[str]) -> List[str]:
+        """按 URL 中的页码线索排序，减少多页结果乱序。"""
+        indexed_urls = []
+        for index, url in enumerate(urls or []):
+            indexed_urls.append({
+                'url': url,
+                'index': index,
+                'page': self._extract_url_page_number(url) or self._extract_818ps_preview_page_number(url),
+            })
+
+        indexed_urls.sort(key=lambda item: (
+            item['page'] is None,
+            item['page'] if item['page'] is not None else 10**9,
+            item['index'],
+        ))
+        return [item['url'] for item in indexed_urls]
+
+    def _dedupe_keep_order(self, items) -> List[str]:
+        """保持发现顺序去重。"""
+        seen = set()
+        ordered_items: List[str] = []
+        for item in items or []:
+            if not isinstance(item, str):
+                continue
+            normalized_item = item.strip()
+            if not normalized_item or normalized_item in seen:
+                continue
+            seen.add(normalized_item)
+            ordered_items.append(normalized_item)
+        return ordered_items
+
     def _normalize_dynamic_candidate_url(self, url: Optional[str]) -> Optional[str]:
         """
         规范化动态提取出来的URL
@@ -952,7 +1354,7 @@ class Tuguaishou818psCrawler:
             resolved_urls.append(chosen_url)
             seen_urls.add(chosen_url)
 
-        return resolved_urls
+        return self._sort_urls_by_page_token(resolved_urls)
 
     def _collect_dynamic_image_candidates(self, dynamic_data: dict) -> List[Dict]:
         """
@@ -1027,7 +1429,7 @@ class Tuguaishou818psCrawler:
                 valid_urls.append(entry['url'])
                 seen.add(entry['url'])
 
-        return valid_urls
+        return self._sort_urls_by_page_token(valid_urls)
 
     def _build_multi_image_result(self, image_urls: List[str], original_url: str, source: str, score: int) -> Dict:
         """
@@ -1040,6 +1442,8 @@ class Tuguaishou818psCrawler:
             if normalized_url and normalized_url not in seen:
                 unique_urls.append(normalized_url)
                 seen.add(normalized_url)
+
+        unique_urls = self._sort_urls_by_page_token(unique_urls)
 
         return {
             'imageUrl': unique_urls[0] if unique_urls else None,
@@ -1072,6 +1476,8 @@ class Tuguaishou818psCrawler:
             'editor/', 'crown', 'vip', 'badge', 'icon', 'logo',
             'material', 'element', 'asset', 'frame', 'mask',
             'sticker', 'watermark', 'toolbar', 'button',
+            'qrcode', 'wechat_qrcode', 'vx-code', 'xcx-code',
+            'index_hot_day', 'new-index/',
             'ips_user_preview_api',
             'ips_svg/', 'ips_group_word/', 'ips_icon/', 'ips_material/',
             'group_word/', 'wordart/', 'font/', 'text/', 'emoji/'
@@ -1111,6 +1517,8 @@ class Tuguaishou818psCrawler:
             'placeholder', 'blank', 'ad', 'banner', 'editor/',
             'crown', 'vip', 'badge', 'toolbar', 'button',
             'material', 'element', 'sticker', 'mask', 'frame',
+            'qrcode', 'wechat_qrcode', 'vx-code', 'xcx-code',
+            'index_hot_day', 'new-index/',
             'ips_user_preview_api',
             'ips_svg/', 'ips_group_word/', 'ips_icon/', 'ips_material/',
             'group_word/', 'wordart/', 'font/', 'text/', 'emoji/'
@@ -1524,11 +1932,13 @@ class Tuguaishou818psCrawler:
         # 图片URL的正则模式
         patterns = [
             # 完整HTTP URL
-            r'https?://[^"\'\\s>]+\.(?:png|jpe?g|webp|gif)(?:\?[^"\'\\s>]*)?',
+            r'https?://[^"\'\s>]+\.(?:png|jpe?g|webp|gif)(?:![^"\'\s>]*)?(?:\?[^"\'\s>]*)?',
             # 协议相对URL
-            r'//[^"\'\\s>]+\.(?:png|jpe?g|webp|gif)(?:\?[^"\'\\s>]*)?',
+            r'//[^"\'\s>]+\.(?:png|jpe?g|webp|gif)(?:![^"\'\s>]*)?(?:\?[^"\'\s>]*)?',
             # 相对路径
-            r'/[^"\'\\s>]+\.(?:png|jpe?g|webp|gif)(?:\?[^"\'\\s>]*)?',
+            r'/[^"\'\s>]+\.(?:png|jpe?g|webp|gif)(?:![^"\'\s>]*)?(?:\?[^"\'\s>]*)?',
+            # 818ps / 图怪兽常见预览路径，即使末尾不一定直接是标准扩展名也先收集
+            r'https?://[^"\'\s>]+(?:user_preview_ue|user_preview|user_work|ips_user_preview_api)[^"\'\s>]*',
         ]
         
         # 黑名单关键词 - 过滤统计图片和小图标
@@ -1749,6 +2159,131 @@ class Tuguaishou818psCrawler:
             logging.warning(f"⚠️ URL模式提取失败: {e}")
             return None
     
+    async def _render_page_with_local_chrome(self, url: str) -> Optional[str]:
+        """
+        Re-declared near the end of the class so the dynamic-page fallback keeps
+        the simple DOM-dump behaviour even if earlier experiments changed it.
+        """
+        try:
+            from core.browser_service import BrowserService
+
+            browser_service = BrowserService()
+            return await asyncio.to_thread(
+                browser_service.dump_dom_with_local_chrome,
+                url
+            )
+        except Exception as error:
+            logging.warning(f"⚠️ 本地Chrome渲染DOM失败: {error}")
+            return None
+
+    async def _try_extract_from_browser_resolved_share_url(self, url: str) -> Optional[Dict]:
+        """Resolve `/u/` share shells to the real editor URL, then retry the official share API."""
+        initial_share_params = self._extract_share_query_params(url)
+        if '818ps.com/u/' not in (url or '').lower() or initial_share_params.get('share_id'):
+            return None
+
+        try:
+            from core.browser_service import BrowserService
+
+            browser_service = BrowserService()
+            resolved_url = await asyncio.to_thread(
+                browser_service.resolve_url_with_browser,
+                url
+            )
+        except Exception as error:
+            logging.warning(f"⚠️ 浏览器解析 818ps 分享壳页失败: {error}")
+            return None
+
+        if not isinstance(resolved_url, str) or not resolved_url.strip():
+            return None
+
+        resolved_url = resolved_url.strip()
+        resolved_share_params = self._extract_share_query_params(resolved_url)
+        if not resolved_share_params.get('share_id'):
+            return None
+
+        logging.info(
+            "🔗 818ps 分享壳页已解析到编辑器地址，优先回退官方分享 API: "
+            f"{resolved_url}"
+        )
+        share_api_result = await self._extract_from_share_api(resolved_url)
+        if share_api_result:
+            logging.info("✅ 浏览器解析后的编辑器地址命中官方分享 API")
+        return share_api_result
+
+    async def _extract_dynamic_page(self, url: str) -> Optional[Dict]:
+        """
+        Re-declared near the end of the class so 818ps `/u/` links can first use
+        the browser-resolved editor URL to recover `share_id/upicId/share_uid`,
+        then fall back to dynamic DOM analysis only when needed.
+        """
+        logging.info("🤖 动态页先尝试静态HTML/JSON回退...")
+        initial_share_params = self._extract_share_query_params(url)
+        is_share_shell = (
+            '818ps.com/u/' in (url or '').lower()
+            and not initial_share_params.get('share_id')
+        )
+
+        if is_share_shell:
+            browser_resolved_result = await self._try_extract_from_browser_resolved_share_url(url)
+            if browser_resolved_result:
+                return browser_resolved_result
+
+        static_result = await self._extract_dynamic_page_without_browser(url)
+        if static_result:
+            static_image_url = static_result.get('imageUrl')
+            if not is_share_shell or not static_image_url or self._is_design_page_candidate(static_image_url):
+                return static_result
+
+            logging.warning(
+                f"⚠️ 818ps /u/ 静态回退命中了非设计稿资源，继续走浏览器解析链路: {static_image_url}"
+            )
+
+        browser_resolved_result = await self._try_extract_from_browser_resolved_share_url(url)
+        if browser_resolved_result:
+            return browser_resolved_result
+
+        try:
+            from core.browser_service import BrowserService
+
+            browser_service = BrowserService()
+            dynamic_data = await browser_service.extract_dynamic_content(url)
+
+            if not dynamic_data:
+                return None
+
+            initial_share_params = self._extract_share_query_params(url)
+            resolved_dynamic_url = (
+                dynamic_data.get('resolvedUrl')
+                or dynamic_data.get('currentUrl')
+                or dynamic_data.get('finalUrl')
+            )
+            if isinstance(resolved_dynamic_url, str):
+                resolved_dynamic_url = resolved_dynamic_url.strip()
+            else:
+                resolved_dynamic_url = None
+
+            if (
+                resolved_dynamic_url
+                and resolved_dynamic_url != url
+                and not initial_share_params.get('share_id')
+            ):
+                resolved_share_params = self._extract_share_query_params(resolved_dynamic_url)
+                if resolved_share_params.get('share_id'):
+                    logging.info(
+                        "🔁 动态渲染过程中获取到编辑器最终地址，回退官方分享 API: "
+                        f"{resolved_dynamic_url}"
+                    )
+                    share_api_result = await self._extract_from_share_api(resolved_dynamic_url)
+                    if share_api_result:
+                        logging.info("✅ 动态渲染结果成功补齐分享参数并命中官方分享 API")
+                        return share_api_result
+
+            return await self._analyze_dynamic_data(dynamic_data, url)
+        except Exception as e:
+            logging.warning(f"⚠️ 浏览器动态抓取失败，动态页回退结束: {e}")
+            return None
+
     async def close(self):
         """关闭资源"""
         if self.session:

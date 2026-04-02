@@ -42,6 +42,20 @@ class URLParser:
             # 步骤2: 检测平台类型
             platform = self._detect_platform(clean_url)
             logging.info(f"🎯 检测到平台: {platform}")
+
+            # 818ps /u/ 分享页现在更像前端壳子，保留原始 URL 交给本地渲染提取更稳定
+            if platform == "818ps" and self._is_818ps_user_share_link(clean_url):
+                logging.info("🎨 检测到818ps /u/ 分享页，跳过短链跳转解析，保留原始分享页入口")
+                pic_id, upic_id = self._extract_ids_from_url(clean_url)
+                return {
+                    'success': True,
+                    'original_url': url,
+                    'parsed_url': clean_url,
+                    'platform': '818ps',
+                    'type': 'share_shell',
+                    'pic_id': pic_id,
+                    'upic_id': upic_id
+                }
             
             # 步骤3: 智能短链接解析 (核心优化)
             if self._is_short_link(clean_url):
@@ -203,6 +217,14 @@ class URLParser:
                 return True
         
         return False
+
+    def _is_818ps_user_share_link(self, url: str) -> bool:
+        """判断是否为 818ps / 图怪兽用户分享页入口。"""
+        url_lower = url.lower()
+        return (
+            '818ps.com/u/' in url_lower or
+            'tuguaishou.com/u/' in url_lower
+        )
     
     def _extract_ids_from_url(self, url: str) -> Tuple[Optional[str], Optional[str]]:
         """
