@@ -25,7 +25,7 @@ class Tuguaishou818psCrawler:
     """
     
     def __init__(self):
-        self.validator = ImageValidator(verbose=False)
+        self.validator = ImageValidator(verbose=False, inspect_bytes=True)
         self.variant_builder = VariantBuilder()
         self.session = None
         
@@ -432,7 +432,7 @@ class Tuguaishou818psCrawler:
 
         return groups, expected_page_count
 
-    async def _extract_from_share_api(self, url: str) -> Optional[Dict]:
+    async def _extract_from_share_api(self, url: str, extraction_task=None) -> Optional[Dict]:
         """优先调用 818ps 官方分享 API，直接拿到多页设计稿。"""
         query_params = self._extract_share_query_params(url)
         share_id = query_params.get('share_id')
@@ -451,10 +451,14 @@ class Tuguaishou818psCrawler:
             endpoint('share_template', 'apiV1/template/index/share-template', {'share_id': share_id})
         if upic_id:
             if share_id and share_uid:
-                endpoint('team_share_get_templ', 'api/team-share-get-templ', {
+                api_params = {
                     'upicId': upic_id, 'share_uid': share_uid, 'share_id': share_id,
                     'save_type': save_type, 'user_source': user_source
-                })
+                }
+                # Observed GIF editor request, not a guessed media URL.
+                if urlparse(url).hostname == 'gif.818ps.com':
+                    api_params.update(picId=0, template_type=2)
+                endpoint('team_share_get_templ', 'api/team-share-get-templ', api_params)
             public_params = {'picId': 0, 'upicId': upic_id, 'version_id': 0,
                              'user_template_team_id': 0, 'paperId': 0}
             if share_uid:
@@ -468,7 +472,7 @@ class Tuguaishou818psCrawler:
             *(self._fetch_json(endpoint_url, referer=url) for _, endpoint_url in endpoints),
             return_exceptions=True
         )
-        task = ExtractionTask(self, url)
+        task = extraction_task or ExtractionTask(self, url)
         records = []
         for (name, _), payload in zip(endpoints, responses):
             if isinstance(payload, dict):
@@ -486,6 +490,8 @@ class Tuguaishou818psCrawler:
                         records.append(dict(page=task.number({}, candidate, position),
                                             imageUrl=candidate, source=f'share_api_{name}'))
                         known_urls.add(candidate)
+        for candidate_url in ({record['imageUrl'] for record in records} | set(task.animation.candidates)):
+            task.request_headers.setdefault(candidate_url, {'Referer': url})
         await task.add(records)
         return task.result()
 
@@ -1237,7 +1243,7 @@ class Tuguaishou818psCrawler:
             filename = path.split('/')[-1] if path else ''
             filename = filename.split('!', 1)[0]
             match = re.match(
-                r'^(.+?_\d+)(?:_(\d+))?\.(?:jpg|jpeg|png|webp)$',
+                r'^(.+?_\d+)(?:_(\d+))?\.(?:jpg|jpeg|png|webp|gif)$',
                 filename,
                 re.IGNORECASE
             )
@@ -2251,7 +2257,9 @@ class Tuguaishou818psCrawler:
 
     async def close(self):
         """关闭资源"""
-        if self.session:
-            await self.session.close()
-            self.session = None
-        await self.validator.close()
+        session, self.session = self.session, None
+        try:
+            if session:
+                await session.close()
+        finally:
+            await self.validator.close()

@@ -42,13 +42,15 @@ class ImageValidator:
     POSITIVE_CACHE_TTL = 600
     NEGATIVE_CACHE_TTL = 120
 
-    def __init__(self, verbose: bool = True):
+    def __init__(self, verbose: bool = True, inspect_bytes: bool = False):
         self._log_details = logging.info if verbose else logging.debug
         self._log_validation_failure = logging.warning if verbose else logging.debug
         self.session = None
         self.sync_session = None
         self.sync_fallback_semaphore = threading.BoundedSemaphore(self.SYNC_FALLBACK_CONCURRENCY)
         self.validation_cache: Dict[str, tuple[bool, float]] = {}
+        self.inspect_bytes = inspect_bytes
+        self.media_reports = {}
 
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self._init_sync_session()
@@ -136,6 +138,12 @@ class ImageValidator:
                         if existing.lower() == key.lower():
                             headers.pop(existing)
                     headers[key] = value
+
+            if self.inspect_bytes:
+                report = await self.inspect_media(image_url, headers)
+                valid = report['valid'] and report.get('mediaType', '').startswith('image/')
+                self._store_validation_result(cache_key, valid)
+                return valid
 
             # 方法1: 异步验证 (优先) - 快速模式
             async_result = await self._validate_async_fast(image_url, headers)
@@ -364,15 +372,24 @@ class ImageValidator:
 
     async def close(self):
         """关闭会话"""
-        try:
-            if self.session:
-                await self.session.close()
-                self._log_details("✅ 异步会话已关闭")
-                self.session = None
+        # Detach ownership before awaiting; concurrent cleanup cannot close twice.
+        session, sync_session = self.session, self.sync_session
+        self.session = self.sync_session = None
+        if session:
+            try:
+                await session.close()
+                logging.debug('异步会话已关闭')
+            except Exception as error:
+                logging.warning('异步会话关闭异常: %s', error)
+        if sync_session:
+            try:
+                sync_session.close()
+                logging.debug('同步会话已关闭')
+            except Exception as error:
+                logging.warning('同步会话关闭异常: %s', error)
 
-            if self.sync_session:
-                self.sync_session.close()
-                self._log_details("✅ 同步会话已关闭")
-                self.sync_session = None
-        except Exception as e:
-            logging.warning(f"⚠️ 会话关闭异常: {e}")
+    async def inspect_media(self, image_url, request_headers=None, captured=None, **limits):
+        from utils.media_inspector import inspect
+        report = await inspect(self, image_url, request_headers, captured, **limits)
+        self.media_reports[image_url] = report
+        return report

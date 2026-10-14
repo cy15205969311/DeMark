@@ -26,6 +26,8 @@ class ExtractionTask:
         self.limit = asyncio.Semaphore(8)
         self.stats = dict(candidateCount=0, filteredCount=0, duplicateCount=0,
                           validatedCount=0, stageMs={})
+        from crawlers.tuguaishou_animation import AnimationDiscovery
+        self.animation = AnimationDiscovery(self)
 
     def log(self, stage, **fields):
         logging.getLogger('demark.818ps').info(
@@ -53,6 +55,10 @@ class ExtractionTask:
                 or self.crawler._extract_818ps_preview_page_number(url) or position)
 
     def structured(self, data, source):
+        self.animation.structured(data, source)
+        return self._structured(data, source)
+
+    def _structured(self, data, source):
         """Read only page/preview collections, never arbitrary arrays of assets."""
         records = []
         if isinstance(data, str):
@@ -62,7 +68,7 @@ class ExtractionTask:
                 return records
         if isinstance(data, list):
             for item in data:
-                records.extend(self.structured(item, source))
+                records.extend(self._structured(item, source))
             return records
         if not isinstance(data, dict):
             return records
@@ -94,12 +100,13 @@ class ExtractionTask:
                             if page_id is not None:
                                 record['pageId'] = page_id
                         records.append(record)
-            if isinstance(value, (dict, list)):
-                records.extend(self.structured(value, source))
+            if isinstance(value, (dict, list)) and key not in ('assets','work','gifInfo','materials','elements'):
+                records.extend(self._structured(value, source))
         return records
 
     def read_html(self, content, source='embedded_json'):
         records = []
+        self.animation.read_html(content)
         soup = BeautifulSoup(content or '', 'html.parser')
         for script in soup.find_all('script'):
             text = script.string or script.get_text()
@@ -135,8 +142,19 @@ class ExtractionTask:
 
     async def add(self, records):
         self.stats['candidateCount'] += len(records)
+        from crawlers.tuguaishou_animation import media_hint
+        for record in records:
+            url = record['imageUrl']
+            if self.animation.required or media_hint(url) in ('gif', 'webp', 'video', 'blob'):
+                if media_hint(url) in ('gif', 'video'):
+                    self.animation.required = True
+                self.animation.remember(dict(url=url, page=record['page'], role='output',
+                                             source=record.get('source', 'structured')))
+        await self.animation.validate()
         async def resolve(record):
             number, url = record['page'], record['imageUrl']
+            if url in self.animation.candidates and self.animation.candidates[url].get('role') == 'output':
+                return None
             if number in self.pages and self.pages[number].get('identityConfirmed', True):
                 self.stats['duplicateCount'] += 1
                 return None
@@ -156,7 +174,12 @@ class ExtractionTask:
                 if url in self.request_headers and urlparse(candidate).hostname == urlparse(url).hostname:
                     self.request_headers.setdefault(candidate, self.request_headers[url])
                 if await self.validate(candidate):
-                    return dict(record, imageUrl=candidate)
+                    report = self.crawler.validator.media_reports.get(candidate, {})
+                    if report.get('animationStatus') == 'animated':
+                        self.animation.required = True
+                        self.animation.required_pages.add(number)
+                    return dict(record, imageUrl=candidate,
+                                **{k: report[k] for k in ('mediaType', 'animationStatus', 'frameCount', 'mediaFile') if k in report})
             return None
         results = await asyncio.gather(*(resolve(record) for record in records))
         for record in results:
@@ -194,22 +217,43 @@ class ExtractionTask:
     def result(self):
         pages = [self.pages[n] for n in sorted(self.pages)]
         urls = [page['imageUrl'] for page in pages]
+        animation_targets = (self.animation.required_pages or
+                             (set(range(1, self.expected + 1)) if self.expected else self.animation.output_pages))
+        animation_missing = [n for n in animation_targets
+                             if self.animation.required and (n not in self.pages or
+                                self.pages[n].get('animationStatus') != 'animated')]
         missing = [n for n in range(1, (self.expected or 0) + 1)
-                   if n not in self.pages or not self.pages[n].get('identityConfirmed', True)]
+                   if n not in self.pages or not self.pages[n].get('identityConfirmed', True) or n in animation_missing]
         status = ('complete' if not missing and len(pages) == self.expected else 'partial') if self.expected else 'unknown'
         metadata = dict(self.stats, totalMs=round((time.monotonic() - self.started) * 1000),
                         uniqueImageCount=len(set(urls)), duplicateUrlCount=len(urls) - len(set(urls)))
-        return dict(imageUrl=urls[0] if urls else None, thumbnailUrl=urls[0] if urls else None,
+        result = dict(imageUrl=urls[0] if urls else None, thumbnailUrl=urls[0] if urls else None,
                     imageUrls=urls, images=list(urls), pages=pages, pageCount=len(pages),
                     isMultiPage=len(pages) > 1, expectedPageCount=self.expected,
                     completenessStatus=status, missingPages=missing, source='+'.join(self.sources) or 'none',
                     metadata=metadata, request_id=self.request_id, platform='818ps', original_url=self.url)
+        if self.animation.required or self.animation.candidates:
+            first = pages[0] if pages else {}
+            output_reports = [r for r in self.animation.diagnostics if r.get('role') == 'output' and r.get('valid')]
+            if not first and output_reports:
+                first = output_reports[0]
+            result.update(animationRequired=self.animation.required, animationMissingPages=sorted(animation_missing),
+                          mediaType=first.get('mediaType'), frameCount=first.get('frameCount') if len(pages) == 1 else None,
+                          animationStatus=('animated' if any(p.get('animationStatus') == 'animated' for p in pages)
+                                           else first.get('animationStatus', 'unknown')))
+            if self.animation.required and (animation_missing or not any(
+                    p.get('animationStatus') == 'animated' for p in pages)):
+                result.update(success=False, error='动画资源未提取成功；静态首帧或背景素材不能替代整稿动画')
+                result['completenessStatus'] = 'partial' if self.expected else 'unknown'
+        return result
 
     def complete(self):
         return self.result()['completenessStatus'] == 'complete'
 
     async def add_capture(self, capture):
         self.request_headers.update(capture.get('requestHeadersByUrl', {}))
+        self.expect(capture.get('expectedPageCount'))
+        self.animation.capture(capture)
         records = []
         for payload in capture.get('networkData', []) + capture.get('jsonData', []):
             records.extend(self.structured(payload, 'browser_structured'))
@@ -257,14 +301,14 @@ async def extract_design(crawler, url, params=None):
         key = (share.get('share_id'), share.get('upic_id'), share.get('share_uid'))
         if (key[0] or key[1]) and key not in queried:
             queried.add(key)
-            await stage('公开数据', lambda: crawler._extract_from_share_api(editor_url), merge=True)
+            await stage('公开数据', lambda: crawler._extract_from_share_api(editor_url, extraction_task=task), merge=True)
 
     async def stage(name, operation, merge=False):
         start = time.monotonic()
         task.log(name, state='start')
         try:
             result = await operation()
-            if merge:
+            if merge and result and result.get('request_id') != task.request_id:
                 task.merge(result)
             return result
         except Exception as error:
@@ -321,7 +365,21 @@ async def extract_design(crawler, url, params=None):
                 await query(resolved)
                 await task.add_capture(capture)
                 task.log('画板发现', expected=task.expected, valid=len(task.pages), markers=len(task.discovered))
-                for recovery_round in range(2):
+                if task.animation.required and not task.complete():
+                    # Analyze captured bytes/failures first, then one existing-page preview action.
+                    if task.expected and task.expected > 1:
+                        targets = task.result()['missingPages']
+                        known = [n for n in task.pages if n not in targets]
+                        if targets:
+                            extra = await stage('动画缺页补采', lambda: browser.capture_818ps_pages(
+                                targets, known_pages=known, discover=False))
+                            if extra:
+                                await task.add_capture(extra)
+                    if not task.complete():
+                        extra = await stage('动画补采', browser.capture_818ps_animation)
+                        if extra:
+                            await task.add_capture(extra)
+                for recovery_round in range(0 if task.animation.required else 2):
                     if task.complete():
                         break
                     known = [page for page, record in task.pages.items() if record.get('identityConfirmed', True)]
@@ -338,9 +396,13 @@ async def extract_design(crawler, url, params=None):
                         break
         result = task.result()
         if not result['pageCount']:
-            result.update(success=False, error='未取得有效的整页预览图')
+            result.update(success=False)
+            result.setdefault('error', '未取得有效的整页预览图')
+        result['metadata'].update(task.animation.summaries())
+        task.log('动画结果', mediaType=result.get('mediaType'), animationStatus=result.get('animationStatus'),
+                 frameCount=result.get('frameCount'))
         task.log('图片验证', candidates=task.stats['candidateCount'], valid=len(task.pages))
-        task.log('完整性', expected=task.expected, status=result['completenessStatus'], missing=result['missingPages'])
+        task.log('完整性', expected=task.expected, actual=len(task.pages), status=result['completenessStatus'], missing=result['missingPages'])
         return result
     except Exception as error:
         logging.getLogger('demark.818ps').warning('[任务失败] request_id=%s error=%s reason=%s',

@@ -74,8 +74,11 @@ class ImageExtractor:
             urls = [page['imageUrl'] for page in pages]
             expected = result.get('expectedPageCount')
             missing = [page for page in range(1, (expected or 0) + 1)
-                       if page not in {int(item['page']) for item in pages if item.get('identityConfirmed', True)}]
+                       if page not in {int(item['page']) for item in pages if item.get('identityConfirmed', True)}
+                       or page in result.get('animationMissingPages', [])]
             status = ('complete' if not missing and len(pages) == expected else 'partial') if expected else 'unknown'
+            if result.get('animationRequired') and result.get('animationMissingPages'):
+                status = 'partial' if expected else 'unknown'
             normalized.update(pages=pages, imageUrls=urls, images=list(urls),
                               imageUrl=urls[0] if urls else None, pageCount=len(pages),
                               isMultiPage=len(pages) > 1, completenessStatus=status,

@@ -394,7 +394,7 @@ class Test818psCrawler:
             'scrape': 0,
         }
 
-        async def fake_share_api(url):
+        async def fake_share_api(url, extraction_task=None):
             call_state['share_api'] += 1
             return {
                 'imageUrl': 'https://img.tuguaishou.com/user_preview_ue/share_page1.jpg!l1600',
@@ -709,7 +709,7 @@ class Test818psCrawler:
                 }
             return {}
 
-        async def fake_validate(url):
+        async def fake_validate(url, request_headers=None):
             return url in set(expected_urls)
 
         crawler._fetch_json = fake_fetch_json
@@ -876,7 +876,9 @@ class Test818psCrawler:
         result = await crawler._extract_dynamic_page('https://818ps.com/u/test')
         assert result['completenessStatus'] == 'complete'
         assert result['source'] == 'share_api_share_template'
-        crawler._extract_from_share_api.assert_awaited_once_with(resolved)
+        crawler._extract_from_share_api.assert_awaited_once()
+        assert crawler._extract_from_share_api.await_args.args == (resolved,)
+        assert crawler._extract_from_share_api.await_args.kwargs['extraction_task'].request_id == result['request_id']
         BrowserService.open_818ps_page.assert_awaited_once()
         BrowserService.resolve_url_with_browser.assert_not_called()
         BrowserService.capture_818ps_pages.assert_not_awaited()

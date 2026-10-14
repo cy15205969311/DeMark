@@ -145,7 +145,7 @@ async def test_identical_urls_keep_distinct_structured_page_identity(crawler):
 async def test_expired_signature_is_missing_without_unsigned_rewrite(crawler):
     expired = image(2).replace('test', 'expired')
     crawler._fetch_json.return_value = {'pageCount': 2, 'preview': [image(1), expired]}
-    crawler.validator.validate_image_url.side_effect = lambda url: 'expired' not in url
+    crawler.validator.validate_image_url.side_effect = lambda url, request_headers=None: 'expired' not in url
     BrowserService.open_818ps_page.return_value = {'currentUrl': EDITOR}
     result = await crawler.extract_image(EDITOR)
     assert result['completenessStatus'] == 'partial'

@@ -70,6 +70,22 @@ class ImageDownloader:
             下载结果字典
         """
         try:
+            if platform == '818ps':
+                # Use the exact validated bytes; do not re-fetch an expiring signature
+                # or accidentally download a JPEG derivative in place of an animation.
+                import json
+                import shutil
+                cache_dir = Path(__file__).resolve().parents[1] / 'cache' / '818ps_media'
+                index = cache_dir / (hashlib.sha256(image_url.encode()).hexdigest() + '.json')
+                if index.is_file():
+                    record = json.loads(index.read_text(encoding='utf-8'))
+                    source = Path(record['mediaFile']).resolve()
+                    if source.parent == cache_dir.resolve() and source.is_file():
+                        name = filename or self._generate_filename(image_url, platform)
+                        target = (self.download_dir / name).with_suffix(source.suffix)
+                        await asyncio.to_thread(shutil.copyfile, source, target)
+                        return dict(success=True, file_path=str(target), filename=target.name,
+                                    size=source.stat().st_size, status='downloaded', download_time=0)
             logging.info(f"📥 开始下载图片: {image_url}")
             
             # 创建会话

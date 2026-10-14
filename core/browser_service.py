@@ -32,6 +32,9 @@ class BrowserService:
         self._818ps_capture = {}
         self._818ps_pending_responses = {}
         self._818ps_request_headers = {}
+        self._818ps_media = {}
+        self._818ps_requests = {}
+        self._818ps_extra_headers = {}
         self.request_id = None
         self.chrome_paths = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -1362,7 +1365,8 @@ class BrowserService:
                 self.driver.set_page_load_timeout(15)
                 self.driver.set_script_timeout(5)
                 self.driver.implicitly_wait(0)
-                self.driver.execute_cdp_cmd('Network.enable', {})
+                self.driver.execute_cdp_cmd('Network.enable', {'maxTotalBufferSize':64*1024*1024,
+                                                              'maxResourceBufferSize':32*1024*1024})
                 driver_path = getattr(getattr(self.driver, 'service', None), 'path', None)
                 if driver_path:
                     self._driver_paths[cache_key] = driver_path
@@ -1420,18 +1424,54 @@ class BrowserService:
                     request = params.get('request', {})
                     image_url = request.get('url', '')
                     host = urlparse(image_url).hostname or ''
-                    if host.endswith(('.818ps.com', '.tuguaishou.com')):
+                    previous = self._818ps_requests.get(request_id, {})
+                    request['originalUrl'] = previous.get('originalUrl', image_url)
+                    self._818ps_requests[request_id] = request
+                    if image_url.startswith(('http://', 'https://')):
                         headers = {key: value for key, value in request.get('headers', {}).items()
                                    if key.lower() in ('referer', 'origin', 'cookie', 'user-agent')}
+                        headers.update(self._818ps_extra_headers.get(request_id, {}))
                         if headers:
                             self._818ps_request_headers[image_url] = headers
+                elif method == 'Network.requestWillBeSentExtraInfo':
+                    headers = {key: value for key, value in params.get('headers', {}).items()
+                               if key.lower() in ('referer', 'origin', 'cookie', 'user-agent')}
+                    self._818ps_extra_headers[request_id] = headers
+                    request_url = self._818ps_requests.get(request_id, {}).get('url')
+                    if request_url:
+                        self._818ps_request_headers.setdefault(request_url, {}).update(headers)
                 elif method == 'Network.responseReceived':
                     response = params.get('response', {})
                     host = urlparse(response.get('url', '')).hostname or ''
+                    mime = response.get('mimeType', '')
+                    if (params.get('type') in ('Image', 'Media') or
+                            (params.get('type') in ('Fetch', 'XHR') and
+                             (mime.startswith(('image/', 'video/')) or mime == 'application/octet-stream'))):
+                        request = self._818ps_requests.get(request_id, {})
+                        headers = response.get('headers', {})
+                        record = dict(url=request.get('url') or response['url'], finalUrl=response['url'],
+                                      originalRequestUrl=request.get('originalUrl') or response['url'],
+                                      source='network_response', requestId=request_id,
+                                      resourceType=params.get('type'), httpStatus=response.get('status'),
+                                      contentType=mime, contentLength=next((v for k, v in headers.items()
+                                                                          if k.lower() == 'content-length'), None))
+                        self._818ps_media[request_id] = record
                     if ((host == '818ps.com' or host.endswith('.818ps.com'))
                             and ('json' in response.get('mimeType', '') or '/api' in response.get('url', ''))):
                         self._818ps_pending_responses[request_id] = response
-                elif method == 'Network.loadingFinished' and request_id in self._818ps_pending_responses:
+                elif method == 'Network.loadingFinished':
+                    record = self._818ps_media.get(request_id)
+                    if record and params.get('encodedDataLength', 0) <= 32 * 1024 * 1024:
+                        # Small UI resources remain metadata only. Read plausible design media once.
+                        path = urlparse(record['url']).path.lower()
+                        if ('gif_complete_img' in path or '/user_preview' in path or
+                                '/ips_gif_asset/' in path or record['contentType'].startswith('video/')
+                                or record['contentType'] in ('image/gif', 'image/webp', 'application/octet-stream')):
+                            body = self.driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': request_id})
+                            record['bodyBase64'] = (body['body'] if body.get('base64Encoded') else
+                                                    base64.b64encode(body['body'].encode()).decode())
+                    if request_id not in self._818ps_pending_responses:
+                        continue
                     response = self._818ps_pending_responses.pop(request_id)
                     if params.get('encodedDataLength', 0) > 8_000_000:
                         continue
@@ -1440,6 +1480,8 @@ class BrowserService:
                     payloads.append(json.loads(content))
                 elif method == 'Network.loadingFailed':
                     self._818ps_pending_responses.pop(request_id, None)
+                    if request_id in self._818ps_media:
+                        self._818ps_media[request_id]['failureReason'] = 'network_failed'
             except (ValueError, KeyError, TypeError):
                 continue
             except Exception as error:
@@ -1451,6 +1493,10 @@ class BrowserService:
         snapshot['networkData'] = self._read_818ps_network()
         snapshot['requestHeadersByUrl'] = dict(self._818ps_request_headers)
         snapshot['currentUrl'] = self.driver.current_url
+        from core.tuguaishou_media_capture import capture_dom_media
+        snapshot['mediaCandidates'] = capture_dom_media(self.driver, self._818ps_capture.get('mediaCandidates', []))
+        snapshot['mediaResponses'] = list(self._818ps_media.values())
+        snapshot['hasCanvas'] = self.driver.execute_script('return !!document.querySelector("canvas")')
         # Explicit total labels are evidence; visible page markers alone are not.
         snapshot['expectedPageCount'] = self.driver.execute_script("""
             var text = document.body ? document.body.innerText : '';
@@ -1463,11 +1509,42 @@ class BrowserService:
         network = self._818ps_capture.get('networkData', []) + snapshot.get('networkData', [])
         expected = max(self._818ps_capture.get('expectedPageCount') or 0,
                        snapshot.get('expectedPageCount') or 0)
+        media = {item['url']: item for item in self._818ps_capture.get('mediaCandidates', [])}
+        media.update({item['url']: item for item in snapshot.get('mediaCandidates', [])})
         self._818ps_capture = self._merge_dynamic_capture(self._818ps_capture, snapshot)
         self._818ps_capture.update(networkData=network, expectedPageCount=expected or None,
                                    currentUrl=snapshot.get('currentUrl'),
                                    requestHeadersByUrl=snapshot.get('requestHeadersByUrl', {}))
+        self._818ps_capture.update(mediaCandidates=list(media.values()),
+                                   mediaResponses=snapshot.get('mediaResponses', []),
+                                   hasCanvas=snapshot.get('hasCanvas', False))
         return self._818ps_capture
+
+    async def capture_818ps_animation(self):
+        """One bounded preview action on the existing editor, never an export/login action."""
+        def capture():
+            clicked = self.driver.execute_script("""
+                const candidates = Array.from(document.querySelectorAll('button,a,div,span'));
+                const e = candidates.find(e => e.innerText && e.innerText.trim() === '预览'
+                    && e.getBoundingClientRect().width > 0);
+                if (e) e.click();
+                return !!e;
+            """)
+            before = {key for key, value in self._818ps_media.items() if value.get('bodyBase64')}
+            deadline = time.monotonic() + (3 if clicked else 1)
+            while time.monotonic() < deadline:
+                self._merge_818ps_snapshot(self._snapshot_818ps())
+                finished = {key for key, value in self._818ps_media.items() if value.get('bodyBase64')}
+                if finished - before:
+                    break
+                time.sleep(.2)
+            return dict(self._818ps_capture, animationPreviewAction=clicked)
+        operation = asyncio.create_task(asyncio.to_thread(capture))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await asyncio.gather(operation, return_exceptions=True)
+            raise
 
     async def open_818ps_page(self, url: str):
         operation = asyncio.create_task(asyncio.to_thread(self._open_818ps_page, url))
