@@ -1,85 +1,55 @@
 @echo off
-chcp 65001 >nul
+setlocal
+
+set "PROJECT_ROOT=%~dp0"
+set "VENV_PYTHON=%PROJECT_ROOT%\.venv\Scripts\python.exe"
+set "PYTHON310=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
+set "PYTHON_EXE=python"
+
+if exist "%VENV_PYTHON%" (
+    set "PYTHON_EXE=%VENV_PYTHON%"
+) else if exist "%PYTHON310%" (
+    set "PYTHON_EXE=%PYTHON310%"
+)
+
 echo ========================================
-echo 多平台图片爬取工具 v2.0 - 一键部署脚本
-echo 基于成功Node.js逻辑的Python实现
+echo DeMark setup and launch
 echo ========================================
 echo.
 
-:: 检查Python是否安装
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ❌ 错误: 未检测到Python，请先安装Python 3.8+
-    echo 下载地址: https://www.python.org/downloads/
-    pause
+"%PYTHON_EXE%" --version >nul 2>&1
+if errorlevel 1 (
+    echo Python is not available. Install Python 3.10 or create a .venv first.
     exit /b 1
 )
 
-echo ✅ 检测到Python环境
-python --version
+echo Using interpreter:
+"%PYTHON_EXE%" --version
+echo.
 
-:: 检查pip是否可用
-pip --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ❌ 错误: pip不可用，请检查Python安装
-    pause
+"%PYTHON_EXE%" -m pip --version >nul 2>&1
+if errorlevel 1 (
+    echo pip is not available for the selected interpreter.
     exit /b 1
 )
 
-echo ✅ pip可用
-echo.
+echo Upgrading pip...
+"%PYTHON_EXE%" -m pip install --upgrade pip
+if errorlevel 1 exit /b 1
 
-:: 升级pip
-echo 📦 升级pip到最新版本...
-python -m pip install --upgrade pip
-
-:: 安装依赖
-echo 📦 安装项目依赖...
-pip install -r requirements.txt
-
-if %errorlevel% neq 0 (
-    echo ❌ 依赖安装失败，请检查网络连接或手动安装
-    pause
+echo Installing project dependencies...
+"%PYTHON_EXE%" -m pip install -r "%PROJECT_ROOT%requirements.txt"
+if errorlevel 1 (
+    echo Dependency installation failed.
     exit /b 1
 )
 
-echo ✅ 依赖安装完成
+echo Preparing runtime directories...
+if not exist "%PROJECT_ROOT%downloads" mkdir "%PROJECT_ROOT%downloads"
+if not exist "%PROJECT_ROOT%logs" mkdir "%PROJECT_ROOT%logs"
+if not exist "%PROJECT_ROOT%cache" mkdir "%PROJECT_ROOT%cache"
 echo.
 
-:: 创建必要目录
-echo 📁 创建项目目录...
-if not exist "downloads" mkdir downloads
-if not exist "logs" mkdir logs
-if not exist "cache" mkdir cache
-
-echo ✅ 目录创建完成
-echo.
-
-:: 检查Chrome浏览器
-echo 🌐 检查Chrome浏览器...
-reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe" >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ⚠️  警告: 未检测到Chrome浏览器
-    echo    Selenium功能可能无法正常工作
-    echo    建议安装Chrome浏览器: https://www.google.com/chrome/
-) else (
-    echo ✅ 检测到Chrome浏览器
-)
-echo.
-
-:: 运行应用
-echo 🚀 启动应用程序...
-echo ========================================
-python main.py
-
-if %errorlevel% neq 0 (
-    echo.
-    echo ❌ 应用程序运行出错
-    echo 请检查日志文件: crawler.log
-    pause
-    exit /b 1
-)
-
-echo.
-echo ✅ 应用程序正常退出
-pause
+echo Launching DeMark...
+"%PYTHON_EXE%" "%PROJECT_ROOT%main.py"
+exit /b %ERRORLEVEL%

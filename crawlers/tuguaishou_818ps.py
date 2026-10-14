@@ -6,7 +6,7 @@ import re
 import aiohttp
 import asyncio
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from typing import Dict, Optional, List, Tuple
 import logging
 import sys
@@ -25,7 +25,7 @@ class Tuguaishou818psCrawler:
     """
     
     def __init__(self):
-        self.validator = ImageValidator()
+        self.validator = ImageValidator(verbose=False)
         self.variant_builder = VariantBuilder()
         self.session = None
         
@@ -72,6 +72,74 @@ class Tuguaishou818psCrawler:
             'user_source': params.get('user_source', [''])[0],
         }
 
+    def _build_editor_url_from_share_params(self, share_params: Dict[str, Optional[str]]) -> Optional[str]:
+        """根据分享参数拼出可用于官方分享 API 的编辑器地址。"""
+        share_id = share_params.get('share_id')
+        upic_id = share_params.get('upic_id')
+        share_uid = share_params.get('share_uid')
+        if not share_id:
+            return None
+
+        query_items = []
+        if upic_id:
+            query_items.append(('upicId', upic_id))
+        if share_uid:
+            query_items.append(('share_uid', share_uid))
+        query_items.append(('share_id', share_id))
+        query_items.append(('save_type', share_params.get('save_type') or ''))
+        query_items.append(('user_source', share_params.get('user_source') or ''))
+
+        return f"https://ue.818ps.com/v4/?{urlencode(query_items)}"
+
+    def _extract_editor_share_url_from_text(self, text: str, request_url: str) -> Optional[str]:
+        """从 `/u/` 分享壳页的源码或渲染文本中尝试恢复编辑器地址。"""
+        if not isinstance(text, str) or not text.strip():
+            return None
+
+        normalized_text = text.replace('\\/', '/').replace('&amp;', '&')
+
+        full_url_patterns = [
+            r'https?://ue\.818ps\.com/v4/\?[^"\'\s<>]+',
+            r'//ue\.818ps\.com/v4/\?[^"\'\s<>]+',
+        ]
+        for pattern in full_url_patterns:
+            match = re.search(pattern, normalized_text, re.IGNORECASE)
+            if not match:
+                continue
+
+            candidate_url = match.group(0)
+            if candidate_url.startswith('//'):
+                candidate_url = f'https:{candidate_url}'
+            candidate_params = self._extract_share_query_params(candidate_url)
+            if candidate_params.get('share_id'):
+                return candidate_url
+
+        request_params = self._extract_share_query_params(request_url)
+
+        def extract_param(name_patterns: List[str]) -> Optional[str]:
+            for name_pattern in name_patterns:
+                match = re.search(
+                    rf'{name_pattern}\s*["\':=, ]+\s*["\']?(\d+)["\']?',
+                    normalized_text,
+                    re.IGNORECASE
+                )
+                if match:
+                    return match.group(1)
+            return None
+
+        synthesized_params = {
+            'share_id': extract_param([r'share_id', r'shareId']),
+            'share_uid': extract_param([r'share_uid', r'shareUid']),
+            'upic_id': extract_param([r'upicId', r'upic_id']),
+            'save_type': request_params.get('save_type') or '',
+            'user_source': request_params.get('user_source') or '',
+        }
+
+        if synthesized_params['share_id']:
+            return self._build_editor_url_from_share_params(synthesized_params)
+
+        return None
+
     async def _fetch_json(self, url: str, referer: Optional[str] = None) -> Optional[Dict]:
         """统一发起 JSON 请求。"""
         await self._ensure_session()
@@ -85,12 +153,12 @@ class Tuguaishou818psCrawler:
         try:
             async with self.session.get(url, headers=request_headers, timeout=15) as response:
                 if response.status != 200:
-                    logging.warning(f"⚠️ 分享API响应异常 ({response.status}): {url}")
+                    logging.debug(f"⚠️ 分享API响应异常 ({response.status}): {url}")
                     return None
 
                 return await response.json(content_type=None)
         except Exception as error:
-            logging.warning(f"⚠️ 分享API请求失败: {url} ({error})")
+            logging.debug(f"⚠️ 分享API请求失败: {url} ({error})")
             return None
 
     def _extract_expected_page_count_from_share_api_payloads(self, payloads: Dict[str, Dict]) -> int:
@@ -179,6 +247,61 @@ class Tuguaishou818psCrawler:
         if not normalized_url:
             return []
 
+        original_parts = urlparse(normalized_url)
+        original_base_path = re.sub(r'!.*$', '', original_parts.path or '', flags=re.IGNORECASE)
+        original_query = (original_parts.query or '').lower()
+        original_extension = os.path.splitext(original_base_path)[1].lower()
+
+        def score_candidate(candidate_url: str, original_index: int) -> tuple:
+            candidate_parts = urlparse(candidate_url)
+            candidate_path = candidate_parts.path or ''
+            candidate_path_lower = candidate_path.lower()
+            candidate_base_path = re.sub(r'!.*$', '', candidate_path, flags=re.IGNORECASE)
+            candidate_query = (candidate_parts.query or '').lower()
+            candidate_extension = os.path.splitext(candidate_base_path)[1].lower()
+
+            score = 0
+
+            if candidate_query == original_query:
+                score += 220 if original_query else 40
+            elif original_query and not candidate_query:
+                score -= 180
+
+            if 'auth_key=' in candidate_query:
+                score += 90
+
+            if candidate_base_path == original_base_path:
+                score += 100
+
+            if candidate_path == original_parts.path:
+                score += 80
+
+            if '!l1000_b' in (original_parts.path or '').lower() and '!l1000_b' not in candidate_path_lower:
+                score += 120
+
+            if '!l1600' in candidate_path_lower or '!l2000' in candidate_path_lower:
+                score += 35
+
+            if 'user_preview_ue' in candidate_path_lower:
+                score += 30
+            elif 'user_preview' in candidate_path_lower:
+                score += 15
+
+            if '/pic/' in candidate_path_lower:
+                score -= 20
+            if 'user_origin_ue' in candidate_path_lower:
+                score -= 10
+
+            if candidate_extension == original_extension:
+                score += 20
+
+            if prefer_variants and candidate_url != normalized_url:
+                score += 15
+            elif candidate_url == normalized_url:
+                score += 10
+
+            return (-score, original_index)
+
         variants = [
             self._normalize_dynamic_candidate_url(variant)
             for variant in self.variant_builder.build_818ps_variants(normalized_url)
@@ -186,18 +309,33 @@ class Tuguaishou818psCrawler:
         variants = [variant for variant in variants if variant]
 
         ordered_candidates = variants + [normalized_url] if prefer_variants else [normalized_url] + variants
-        return self._dedupe_keep_order(ordered_candidates)
+        deduped_candidates = self._dedupe_keep_order(ordered_candidates)
+        ranked_candidates = sorted(
+            enumerate(deduped_candidates),
+            key=lambda item: score_candidate(item[1], item[0])
+        )
+        return [candidate_url for _, candidate_url in ranked_candidates]
 
     async def _resolve_818ps_entry_url(self, image_url: str, prefer_variants: bool = False) -> Optional[str]:
         normalized_url = self._normalize_dynamic_candidate_url(image_url)
         if not normalized_url:
             return None
 
-        for candidate_url in self._build_818ps_variant_candidates(normalized_url, prefer_variants=prefer_variants):
-            if await self.validator.validate_image_url(candidate_url):
-                if candidate_url != normalized_url:
-                    logging.info(f"✅ 818ps 分享页已命中去水印候选: {candidate_url}")
-                return candidate_url
+        candidate_urls = self._build_818ps_variant_candidates(normalized_url, prefer_variants=prefer_variants)
+        if not candidate_urls:
+            return None
+
+        fast_candidates = candidate_urls[:8]
+        remaining_candidates = candidate_urls[8:]
+
+        resolved_url = await self._find_first_valid_candidate(fast_candidates)
+        if not resolved_url and remaining_candidates:
+            resolved_url = await self._find_first_valid_candidate(remaining_candidates)
+
+        if resolved_url:
+            if resolved_url != normalized_url:
+                logging.debug(f"✅ 818ps 分享页已命中去水印候选: {resolved_url}")
+            return resolved_url
 
         return None
 
@@ -303,99 +441,53 @@ class Tuguaishou818psCrawler:
         save_type = query_params.get('save_type') or ''
         user_source = query_params.get('user_source') or ''
 
-        if not share_id:
+        if not share_id and not upic_id:
             return None
 
-        payloads: Dict[str, Dict] = {}
-        endpoints = [
-            ('share_template', f'https://818ps.com/apiV1/template/index/share-template?share_id={share_id}'),
-        ]
+        endpoints = []
+        def endpoint(name, path, params):
+            endpoints.append((name, f'https://818ps.com/{path}?{urlencode(params)}'))
+        if share_id:
+            endpoint('share_template', 'apiV1/template/index/share-template', {'share_id': share_id})
+        if upic_id:
+            if share_id and share_uid:
+                endpoint('team_share_get_templ', 'api/team-share-get-templ', {
+                    'upicId': upic_id, 'share_uid': share_uid, 'share_id': share_id,
+                    'save_type': save_type, 'user_source': user_source
+                })
+            public_params = {'picId': 0, 'upicId': upic_id, 'version_id': 0,
+                             'user_template_team_id': 0, 'paperId': 0}
+            if share_uid:
+                public_params['share_uid'] = share_uid
+            endpoint('get_template_page_data', 'apiv2/get-template-page-data', public_params)
+            endpoint('get_template_info', 'apiv2/get-template-info', public_params)
 
-        if upic_id and share_uid:
-            endpoints.extend([
-                (
-                    'team_share_get_templ',
-                    'https://818ps.com/api/team-share-get-templ'
-                    f'?upicId={upic_id}&share_uid={share_uid}&share_id={share_id}'
-                    f'&save_type={save_type}&user_source={user_source}'
-                ),
-                (
-                    'get_template_page_data',
-                    'https://818ps.com/apiv2/get-template-page-data'
-                    f'?picId=0&upicId={upic_id}&version_id=0&user_template_team_id=0'
-                    f'&paperId=0&share_uid={share_uid}'
-                ),
-                (
-                    'get_template_info',
-                    'https://818ps.com/apiv2/get-template-info'
-                    f'?picId=0&paperId=0&upicId={upic_id}&version_id=0'
-                    f'&user_template_team_id=0&share_uid={share_uid}'
-                ),
-            ])
+        from crawlers.tuguaishou_pipeline import ExtractionTask
 
-        for endpoint_name, endpoint_url in endpoints:
-            payload = await self._fetch_json(endpoint_url, referer=url)
+        responses = await asyncio.gather(
+            *(self._fetch_json(endpoint_url, referer=url) for _, endpoint_url in endpoints),
+            return_exceptions=True
+        )
+        task = ExtractionTask(self, url)
+        records = []
+        for (name, _), payload in zip(endpoints, responses):
             if isinstance(payload, dict):
-                payloads[endpoint_name] = payload
-
-        preview_groups, expected_page_count = self._extract_share_api_preview_groups(payloads)
-        if not preview_groups:
-            return None
-
-        best_result: Optional[Dict] = None
-        best_result_rank = (-1, -1, -1)
-
-        for source_name, candidate_urls in preview_groups:
-            entries = [
-                {
-                    'url': candidate_url,
-                    'source': f'share_api_{source_name}',
-                    'score': self._score_dynamic_image(candidate_url, f'share_api_{source_name}')
-                }
-                for candidate_url in candidate_urls
-            ]
-            valid_urls = await self._resolve_818ps_image_entry_urls(entries, prefer_variants=True)
-            if not valid_urls:
-                continue
-
-            result = self._build_multi_image_result(
-                valid_urls,
-                url,
-                f'share_api_{source_name}',
-                max((entry['score'] for entry in entries), default=0)
-            )
-            result_rank = (
-                1 if expected_page_count <= 1 or len(valid_urls) >= expected_page_count else 0,
-                len(valid_urls),
-                self._share_api_source_priority(source_name),
-            )
-
-            if result_rank > best_result_rank:
-                best_result = result
-                best_result_rank = result_rank
-
-            if result_rank[0]:
-                logging.info(
-                    f"✅ 官方分享API提取成功: source={source_name}, "
-                    f"pages={len(valid_urls)}, expected={expected_page_count or len(valid_urls)}"
-                )
-                return result
-
-        if best_result:
-            if expected_page_count > 1 and best_result.get('pageCount', 0) < expected_page_count:
-                logging.warning(
-                    f"⚠️ 官方分享API仅拿到部分页面: source={best_result.get('source')}, "
-                    f"pages={best_result.get('pageCount', 0)}, expected={expected_page_count}"
-                )
-            return best_result
-
-        if expected_page_count > 1:
-            logging.warning(
-                f"⚠️ 官方分享API已拿到候选结果，但有效页数不足: expected={expected_page_count}, "
-                f"groups={[name for name, _ in preview_groups]}"
-            )
-
-        return None
+                records.extend(task.structured(payload, f'share_api_{name}'))
+        # Preserve the existing, narrowly scoped missing-cover filename rule.
+        groups, inferred_count = self._extract_share_api_preview_groups({
+            name: payload for (name, _), payload in zip(endpoints, responses)
+            if isinstance(payload, dict)
+        })
+        if task.expected and inferred_count == task.expected:
+            known_urls = {record['imageUrl'] for record in records}
+            for name, urls in groups:
+                for position, candidate in enumerate(urls, 1):
+                    if candidate not in known_urls:
+                        records.append(dict(page=task.number({}, candidate, position),
+                                            imageUrl=candidate, source=f'share_api_{name}'))
+                        known_urls.add(candidate)
+        await task.add(records)
+        return task.result()
 
     async def _find_first_valid_candidate(self, candidate_urls: List[str]) -> Optional[str]:
         """
@@ -411,7 +503,7 @@ class Tuguaishou818psCrawler:
             for future in asyncio.as_completed(tasks):
                 candidate_url, is_valid = await future
                 if is_valid:
-                    logging.info(f"✅ 找到有效候选URL: {candidate_url}")
+                    logging.debug(f"✅ 找到有效候选URL: {candidate_url}")
                     return candidate_url
             return None
         finally:
@@ -439,7 +531,7 @@ class Tuguaishou818psCrawler:
                 if is_valid and score > best_score:
                     best_url = candidate_url
                     best_score = score
-                    logging.info(f"✅ 找到更好的图片URL: {candidate_url} (评分: {score})")
+                    logging.debug(f"✅ 找到更好的图片URL: {candidate_url} (评分: {score})")
             return best_url, best_score
         finally:
             for task in tasks:
@@ -449,98 +541,9 @@ class Tuguaishou818psCrawler:
                 await asyncio.gather(*tasks, return_exceptions=True)
     
     async def extract_image(self, url: str, extracted_params: Optional[Dict] = None) -> Optional[Dict]:
-        """
-        提取818ps图片 - 增强版主入口
-        
-        Args:
-            url: 目标URL
-            extracted_params: 从URL解析器预提取的参数 (pic_id, upic_id)
-        
-        Returns:
-            包含图片信息的字典或None
-        """
-        try:
-            logging.info(f"🎨 开始提取818ps图片: {url}")
-            
-            # 初始化会话
-            await self._ensure_session()
-            
-            # 步骤1: 强制ID优先构建策略 - 关键优化
-            upic_id = None
-            pic_id = None
-            share_id = None
-            
-            # 优先使用预提取的参数
-            if extracted_params and extracted_params.get('upic_id'):
-                upic_id = extracted_params['upic_id']
-                pic_id = extracted_params.get('pic_id')
-                logging.info(f"🎯 使用预提取参数: upicId={upic_id}, picId={pic_id}")
-            
-            # 如果没有预提取参数，从URL中提取
-            query_params = self._extract_share_query_params(url)
-            share_id = query_params.get('share_id')
-            if not upic_id:
-                pic_id = query_params.get('pic_id')
-                upic_id = query_params.get('upic_id')
-                if upic_id:
-                    logging.info(f"🔍 从URL提取参数: picId={pic_id}, upicId={upic_id}")
-            
-            # 🆕 智能分流策略：检测用户分享链接，跳过无效的静态URL构建
-            is_user_share = (('/u/' in url and ('818ps.com' in url or 'tuguaishou.com' in url)) or 
-                           'ue.818ps.com' in url)
+        from crawlers.tuguaishou_pipeline import extract_design
+        return await extract_design(self, url, extracted_params)
 
-            if share_id:
-                logging.info("馃摙 妫€娴嬪埌鍒嗕韩鍙傛暟锛屼紭鍏堝皾璇曞畼鏂瑰垎浜玂PI...")
-                result = await self._extract_from_share_api(url)
-                if result:
-                    logging.info("鉁?瀹樻柟鍒嗕韩API鎻愬彇鎴愬姛锛岃烦杩囧悗缁姩鎬佸洖閫€")
-                    return result
-                logging.warning("鈿狅笍 瀹樻柟鍒嗕韩API鏈懡涓紝缁х画鎵ц鏈湴鍥為€€閾捐矾...")
-            
-            if is_user_share:
-                if upic_id:
-                    logging.info("🚀 检测到用户分享链接且已拿到upicId，先尝试轻量直连构造...")
-                    result = await self._extract_with_upic_id_priority(upic_id, pic_id)
-                    if result:
-                        logging.info("✅ 用户分享链接直连构造成功，跳过动态抓取")
-                        return result
-                    logging.warning("⚠️ 用户分享链接直连构造未命中，回退到动态抓取...")
-                else:
-                    logging.info("🚀 检测到用户分享链接，但未拿到upicId，直接启动动态抓取...")
-            else:
-                # 如果有upicId，优先执行ID构建策略（仅对非用户分享链接）
-                if upic_id:
-                    logging.info("🚀 执行ID优先构建策略...")
-                    result = await self._extract_with_upic_id_priority(upic_id, pic_id)
-                    if result:
-                        logging.info("✅ ID优先构建成功，跳过网页抓取")
-                        return result
-                    else:
-                        logging.warning("⚠️ ID优先构建失败，继续尝试网页抓取...")
-                        # 不要直接返回None，继续执行后续的回退机制
-            
-            # 网页抓取 - 作为ID构建失败后的回退机制
-            logging.info("🌐 启动网页抓取 + 源码分析...")
-            result = await self._scrape_webpage_enhanced(url)
-            if result:
-                return result
-            
-            # 最后的尝试 - 直接从URL构造可能的图片链接
-            logging.info("🔄 尝试URL模式匹配...")
-            result = await self._extract_from_url_patterns(url)
-            if result:
-                return result
-            
-            logging.warning("❌ 所有818ps提取方法都失败了")
-            return None
-            
-        except Exception as error:
-            logging.error(f"❌ 提取818ps图片异常: {error}")
-            return None
-        finally:
-            # 不在这里关闭session，让调用者管理
-            pass
-    
     async def _extract_with_upic_id_priority(self, upic_id: str, pic_id: Optional[str] = None) -> Optional[Dict]:
         """
         强制ID优先构建策略 - 用户路径扩展版
@@ -554,7 +557,7 @@ class Tuguaishou818psCrawler:
             提取结果或None
         """
         try:
-            logging.info(f"🚀 用户路径扩展构建: upicId={upic_id}, picId={pic_id}")
+            logging.debug(f"🚀 用户路径扩展构建: upicId={upic_id}, picId={pic_id}")
             
             # 用户作品路径 - 针对 /u/ 分享页面优化
             candidates = []
@@ -619,7 +622,7 @@ class Tuguaishou818psCrawler:
 
             candidates = list(dict.fromkeys(candidates))
             
-            logging.info(f"🔄 验证 {len(candidates)} 个用户路径候选URL...")
+            logging.debug(f"🔄 验证 {len(candidates)} 个用户路径候选URL...")
 
             candidate_url = await self._find_first_valid_candidate(candidates)
             if candidate_url:
@@ -645,7 +648,7 @@ class Tuguaishou818psCrawler:
         这是最可靠的方法，对应Node.js的核心逻辑
         """
         try:
-            logging.info(f"🔧 构建图片URL: picId={pic_id}, upicId={upic_id}")
+            logging.debug(f"🔧 构建图片URL: picId={pic_id}, upicId={upic_id}")
             
             # 构建可能的图片URL - 基于成功的Node.js模式
             possible_urls = [
@@ -667,11 +670,11 @@ class Tuguaishou818psCrawler:
                 f"https://tuguaishou.com/pic/{upic_id}/{pic_id}.png",
             ]
             
-            logging.info(f"🔄 验证 {len(possible_urls)} 个可能的图片URL...")
+            logging.debug(f"🔄 验证 {len(possible_urls)} 个可能的图片URL...")
             best_url, best_score = await self._find_best_scored_candidate(possible_urls)
             
             if best_url:
-                logging.info(f"🎯 最终选择: {best_url}")
+                logging.debug(f"🎯 最终选择: {best_url}")
                 return {
                     'imageUrl': best_url,
                     'picId': pic_id,
@@ -748,7 +751,7 @@ class Tuguaishou818psCrawler:
         if not html_content:
             return None
 
-        logging.info(f"📄 {source_label}: 获取页面内容 {len(html_content)} 字符")
+        logging.debug(f"📄 {source_label}: 获取页面内容 {len(html_content)} 字符")
 
         extractors = [
             ("Meta标签提取", self._extract_meta_image_from_html),
@@ -759,10 +762,10 @@ class Tuguaishou818psCrawler:
         ]
 
         for extractor_name, extractor in extractors:
-            logging.info(f"🔍 {source_label}: 尝试{extractor_name}...")
+            logging.debug(f"🔍 {source_label}: 尝试{extractor_name}...")
             result = await extractor(html_content, url)
             if result:
-                logging.info(f"✅ {source_label}: {extractor_name}成功")
+                logging.debug(f"✅ {source_label}: {extractor_name}成功")
                 return result
 
         return None
@@ -792,13 +795,13 @@ class Tuguaishou818psCrawler:
                 if resolved_url:
                     resolved_share_params = self._extract_share_query_params(resolved_url)
                     if resolved_share_params.get('share_id'):
-                        logging.info(
+                        logging.debug(
                             "🔗 818ps 分享壳页已解析到编辑器地址，优先回退官方分享 API: "
                             f"{resolved_url}"
                         )
                         share_api_result = await self._extract_from_share_api(resolved_url)
                         if share_api_result:
-                            logging.info("✅ 浏览器解析后的编辑器地址命中官方分享 API")
+                            logging.debug("✅ 浏览器解析后的编辑器地址命中官方分享 API")
                             return share_api_result
             return await asyncio.to_thread(
                 browser_service.dump_dom_with_local_chrome,
@@ -814,12 +817,12 @@ class Tuguaishou818psCrawler:
         增加JSON深度提取，支持动态渲染页面
         """
         try:
-            logging.info(f"🌐 开始增强版网页抓取: {url}")
+            logging.debug(f"🌐 开始增强版网页抓取: {url}")
             await self._ensure_session()
             
             # 检查是否为动态渲染页面
             if self._is_dynamic_like_page(url):
-                logging.info("🔍 检测到动态/分享壳页面，启用静态HTML + 渲染DOM回退...")
+                logging.debug("🔍 检测到动态/分享壳页面，启用静态HTML + 渲染DOM回退...")
                 return await self._extract_dynamic_page(url)
             
             # 获取页面内容 (静态页面)
@@ -844,7 +847,7 @@ class Tuguaishou818psCrawler:
         """
         提取动态渲染页面 - 使用浏览器服务
         """
-        logging.info("🧩 动态页先尝试静态HTML/JSON回退...")
+        logging.debug("🧩 动态页先尝试静态HTML/JSON回退...")
         static_result = await self._extract_dynamic_page_without_browser(url)
         if static_result:
             return static_result
@@ -881,7 +884,7 @@ class Tuguaishou818psCrawler:
                     logging.warning(f"⚠️ 动态页静态抓取失败，响应码: {response.status}")
                 else:
                     html_content = await response.text()
-                    logging.info(f"📄 动态页静态源码获取成功 ({len(html_content)} 字符)")
+                    logging.debug(f"📄 动态页静态源码获取成功 ({len(html_content)} 字符)")
         except Exception as e:
             logging.warning(f"⚠️ 动态页静态回退失败: {e}")
 
@@ -911,15 +914,15 @@ class Tuguaishou818psCrawler:
         分析动态提取的数据，查找图片URL
         """
         try:
-            logging.info("🔍 分析动态数据...")
+            logging.debug("🔍 分析动态数据...")
 
             detected_page_markers = dynamic_data.get('pageMarkers', []) or []
             if detected_page_markers:
-                logging.info(f"📑 浏览器识别到页面标记: {detected_page_markers}")
+                logging.debug(f"📑 浏览器识别到页面标记: {detected_page_markers}")
 
             page_specific_urls = await self._extract_page_specific_image_urls(dynamic_data)
             if page_specific_urls:
-                logging.info(f"📄 逐页激活提取到设计稿页面: {len(page_specific_urls)}")
+                logging.debug(f"📄 逐页激活提取到设计稿页面: {len(page_specific_urls)}")
                 if len(page_specific_urls) > 1:
                     return self._build_multi_image_result(
                         page_specific_urls,
@@ -956,7 +959,7 @@ class Tuguaishou818psCrawler:
                 ]
                 valid_urls = await self._validate_image_entry_urls(entries)
                 if len(valid_urls) > 1:
-                    logging.info(
+                    logging.debug(
                         f"🧩 结构化数据提取到多页结果: source={group.get('source')}, pages={len(valid_urls)}"
                     )
                     return self._build_multi_image_result(
@@ -997,8 +1000,8 @@ class Tuguaishou818psCrawler:
                             continue
                         merged_page_urls.append(normalized_url)
                         seen_page_urls.add(normalized_url)
-                    logging.info(f"🗂️ 检测到设计稿页面数: {len(valid_page_urls)}")
-                    logging.info(f"page-specific merged design pages: {len(merged_page_urls)}")
+                    logging.debug(f"🗂️ 检测到设计稿页面数: {len(valid_page_urls)}")
+                    logging.debug(f"page-specific merged design pages: {len(merged_page_urls)}")
                     if len(detected_page_markers) > len(merged_page_urls):
                         logging.warning(
                             f"⚠️ 页面标记数为 {len(detected_page_markers)}，"
@@ -1287,7 +1290,7 @@ class Tuguaishou818psCrawler:
         if not candidate:
             return None
 
-        candidate = candidate.replace('\\/', '/')
+        candidate = candidate.replace('\\/', '/').replace('&amp;', '&')
         if candidate.startswith('//'):
             candidate = f'https:{candidate}'
 
@@ -1471,7 +1474,7 @@ class Tuguaishou818psCrawler:
         if not normalized_url or not self._is_relevant_dynamic_image(normalized_url):
             return False
 
-        url_lower = normalized_url.lower()
+        url_lower = urlparse(normalized_url).path.lower()
         exclude_keywords = [
             'editor/', 'crown', 'vip', 'badge', 'icon', 'logo',
             'material', 'element', 'asset', 'frame', 'mask',
@@ -1491,7 +1494,7 @@ class Tuguaishou818psCrawler:
             'cdn.818ps.com',
             'static.818ps.com'
         ]
-        if not any(domain in url_lower for domain in trusted_domains):
+        if (urlparse(normalized_url).hostname or '').lower() not in trusted_domains:
             return False
 
         preferred_patterns = [
@@ -1512,9 +1515,10 @@ class Tuguaishou818psCrawler:
             return False
 
         url_lower = normalized_url.lower()
+        path_lower = urlparse(normalized_url).path.lower()
         exclude_keywords = [
             'favicon', 'logo', 'avatar', 'sprite', 'loading',
-            'placeholder', 'blank', 'ad', 'banner', 'editor/',
+            'placeholder', 'blank', '/ad/', 'banner', 'editor/',
             'crown', 'vip', 'badge', 'toolbar', 'button',
             'material', 'element', 'sticker', 'mask', 'frame',
             'qrcode', 'wechat_qrcode', 'vx-code', 'xcx-code',
@@ -1523,7 +1527,7 @@ class Tuguaishou818psCrawler:
             'ips_svg/', 'ips_group_word/', 'ips_icon/', 'ips_material/',
             'group_word/', 'wordart/', 'font/', 'text/', 'emoji/'
         ]
-        if any(keyword in url_lower for keyword in exclude_keywords):
+        if any(keyword in path_lower for keyword in exclude_keywords):
             return False
 
         include_keywords = [
@@ -1652,7 +1656,7 @@ class Tuguaishou818psCrawler:
                                 if page_candidates:
                                     valid_page_urls = await self._validate_image_entry_urls(page_candidates)
                                     if valid_page_urls:
-                                        logging.info(f"🎯 JSON提取找到设计稿页面: {len(valid_page_urls)} 张")
+                                        logging.debug(f"🎯 JSON提取找到设计稿页面: {len(valid_page_urls)} 张")
                                         page_scores = [
                                             entry['score'] for entry in page_candidates
                                             if entry['url'] in valid_page_urls
@@ -1666,7 +1670,7 @@ class Tuguaishou818psCrawler:
 
                                 best_candidate = max(candidate_entries, key=lambda entry: entry['score'], default=None)
                                 if best_candidate and await self.validator.validate_image_url(best_candidate['url']):
-                                    logging.info(f"🎯 JSON提取找到图片: {best_candidate['url']}")
+                                    logging.debug(f"🎯 JSON提取找到图片: {best_candidate['url']}")
                                     return self._build_multi_image_result(
                                         [best_candidate['url']],
                                         url,
@@ -1677,7 +1681,7 @@ class Tuguaishou818psCrawler:
                             # 从JSON数据中提取图片
                             image_url = self._extract_image_from_data(data)
                             if image_url and await self.validator.validate_image_url(image_url):
-                                logging.info(f"🎯 JSON提取找到图片: {image_url}")
+                                logging.debug(f"🎯 JSON提取找到图片: {image_url}")
                                 return {
                                     'imageUrl': image_url,
                                     'platform': '818ps',
@@ -1729,7 +1733,7 @@ class Tuguaishou818psCrawler:
 
                 final_url = await self._try_watermark_removal(image_url)
                 if await self.validator.validate_image_url(final_url):
-                    logging.info(f"🎯 Meta标签找到图片: {final_url}")
+                    logging.debug(f"🎯 Meta标签找到图片: {final_url}")
                     return {
                         'imageUrl': final_url,
                         'platform': '818ps',
@@ -1781,7 +1785,7 @@ class Tuguaishou818psCrawler:
                                 image_url = bg_url if bg_url.startswith('http') else f'https:{bg_url}'
                     
                     if image_url:
-                        logging.info(f"🎯 BeautifulSoup找到图片: {image_url}")
+                        logging.debug(f"🎯 BeautifulSoup找到图片: {image_url}")
                         
                         # 尝试生成无水印变体
                         final_url = await self._try_watermark_removal(image_url)
@@ -1805,7 +1809,7 @@ class Tuguaishou818psCrawler:
         即使URL中没有参数，也能从页面源码中提取关键信息
         """
         try:
-            logging.info("🔍 执行源码正则回退机制...")
+            logging.debug("🔍 执行源码正则回退机制...")
             
             # 定义多种正则模式来搜索picId和upicId
             id_patterns = [
@@ -1851,7 +1855,7 @@ class Tuguaishou818psCrawler:
                     matches = re.findall(pattern, html_content, re.IGNORECASE | re.MULTILINE)
                     if matches:
                         pic_id = matches[0]
-                        logging.info(f"🎯 正则找到picId: {pic_id}")
+                        logging.debug(f"🎯 正则找到picId: {pic_id}")
                         break
             
             # 搜索upicId
@@ -1860,19 +1864,19 @@ class Tuguaishou818psCrawler:
                     matches = re.findall(pattern, html_content, re.IGNORECASE | re.MULTILINE)
                     if matches:
                         upic_id = matches[0]
-                        logging.info(f"🎯 正则找到upicId: {upic_id}")
+                        logging.debug(f"🎯 正则找到upicId: {upic_id}")
                         break
             
             # 如果找到了参数，使用已知参数方法
             if pic_id and upic_id:
-                logging.info(f"✅ 正则提取成功: picId={pic_id}, upicId={upic_id}")
+                logging.debug(f"✅ 正则提取成功: picId={pic_id}, upicId={upic_id}")
                 result = await self._extract_with_known_params(pic_id, upic_id)
                 if result:
                     result['source'] = 'regex_fallback'
                     return result
             
             # 即使没有完整参数，也尝试搜索图片URL
-            logging.info("🔍 搜索页面中的图片URL...")
+            logging.debug("🔍 搜索页面中的图片URL...")
             image_urls = self._extract_image_urls_from_content(html_content)
             candidate_entries = [
                 {
@@ -1890,7 +1894,7 @@ class Tuguaishou818psCrawler:
             if page_candidates:
                 valid_page_urls = await self._validate_image_entry_urls(page_candidates)
                 if valid_page_urls:
-                    logging.info(f"🎯 正则回退找到设计稿页面: {len(valid_page_urls)} 张")
+                    logging.debug(f"🎯 正则回退找到设计稿页面: {len(valid_page_urls)} 张")
                     page_scores = [
                         entry['score'] for entry in page_candidates
                         if entry['url'] in valid_page_urls
@@ -1904,7 +1908,7 @@ class Tuguaishou818psCrawler:
             
             for img_url in image_urls:
                 if await self.validator.validate_image_url(img_url):
-                    logging.info(f"✅ 正则找到有效图片: {img_url}")
+                    logging.debug(f"✅ 正则找到有效图片: {img_url}")
                     
                     # 尝试生成无水印变体
                     final_url = await self._try_watermark_removal(img_url)
@@ -1974,7 +1978,7 @@ class Tuguaishou818psCrawler:
                     clean_url = 'https://818ps.com' + clean_url
                 
                 # 黑名单过滤 - 关键优化
-                url_lower = clean_url.lower()
+                url_lower = urlparse(clean_url).path.lower()
                 is_blacklisted = any(keyword in url_lower for keyword in blacklist_keywords)
                 
                 if is_blacklisted:
@@ -1986,7 +1990,7 @@ class Tuguaishou818psCrawler:
                     urls.add(clean_url)
                     logging.debug(f"✅ 添加候选图片: {clean_url}")
         
-        logging.info(f"🔍 从页面提取到 {len(urls)} 个候选图片URL (已过滤黑名单)")
+        logging.debug(f"🔍 从页面提取到 {len(urls)} 个候选图片URL (已过滤黑名单)")
         return list(urls)
     
     def _is_relevant_image_url(self, url: str) -> bool:
@@ -1995,11 +1999,12 @@ class Tuguaishou818psCrawler:
         更严格的过滤规则，避免统计图片和小图标
         """
         url_lower = url.lower()
+        path_lower = urlparse(url).path.lower()
         
         # 严格的排除关键词 (扩展版)
         exclude_keywords = [
             'favicon', 'icon', 'logo', 'avatar', 'sprite', 
-            'banner', 'ad', 'advertisement', 'tracking',
+            'banner', '/ad/', 'advertisement', 'tracking',
             'analytics', 'pixel', 'beacon', 'p.gif',
             'loading', 'placeholder', 'blank', '1x1',
             'thumb', 'small', 'mini', 'tiny', 'btn',
@@ -2007,7 +2012,7 @@ class Tuguaishou818psCrawler:
         ]
         
         for keyword in exclude_keywords:
-            if keyword in url_lower:
+            if keyword in path_lower:
                 return False
         
         # 包含的关键词 (提高相关性) - 更严格
@@ -2058,7 +2063,7 @@ class Tuguaishou818psCrawler:
             # 验证变体
             for variant in variants:
                 if await self.validator.validate_image_url(variant):
-                    logging.info(f"✅ 找到无水印版本: {variant}")
+                    logging.debug(f"✅ 找到无水印版本: {variant}")
                     return variant
             
             # 如果没有找到有效的无水印版本，返回原URL
@@ -2176,11 +2181,40 @@ class Tuguaishou818psCrawler:
             logging.warning(f"⚠️ 本地Chrome渲染DOM失败: {error}")
             return None
 
+    async def _try_extract_from_share_shell_source(self, url: str) -> Optional[Dict]:
+        """先从 `/u/` 分享壳页的轻量源码中恢复分享参数，避免直接启动驱动。"""
+        try:
+            await self._ensure_session()
+            async with self.session.get(url, timeout=10) as response:
+                if response.status != 200:
+                    return None
+                html_content = await response.text()
+        except Exception as error:
+            logging.debug(f"818ps 分享壳页静态源码提取失败: {error}")
+            return None
+
+        resolved_url = self._extract_editor_share_url_from_text(html_content, url)
+        if not resolved_url:
+            return None
+
+        logging.debug(
+            "🧩 从 818ps 分享壳页静态源码中恢复编辑器地址，优先回退官方分享 API: "
+            f"{resolved_url}"
+        )
+        share_api_result = await self._extract_from_share_api(resolved_url)
+        if share_api_result:
+            logging.debug("✅ 静态源码中的分享参数已成功命中官方分享 API")
+        return share_api_result
+
     async def _try_extract_from_browser_resolved_share_url(self, url: str) -> Optional[Dict]:
         """Resolve `/u/` share shells to the real editor URL, then retry the official share API."""
         initial_share_params = self._extract_share_query_params(url)
         if '818ps.com/u/' not in (url or '').lower() or initial_share_params.get('share_id'):
             return None
+
+        shell_source_result = await self._try_extract_from_share_shell_source(url)
+        if shell_source_result:
+            return shell_source_result
 
         try:
             from core.browser_service import BrowserService
@@ -2202,87 +2236,18 @@ class Tuguaishou818psCrawler:
         if not resolved_share_params.get('share_id'):
             return None
 
-        logging.info(
+        logging.debug(
             "🔗 818ps 分享壳页已解析到编辑器地址，优先回退官方分享 API: "
             f"{resolved_url}"
         )
         share_api_result = await self._extract_from_share_api(resolved_url)
         if share_api_result:
-            logging.info("✅ 浏览器解析后的编辑器地址命中官方分享 API")
+            logging.debug("✅ 浏览器解析后的编辑器地址命中官方分享 API")
         return share_api_result
 
     async def _extract_dynamic_page(self, url: str) -> Optional[Dict]:
-        """
-        Re-declared near the end of the class so 818ps `/u/` links can first use
-        the browser-resolved editor URL to recover `share_id/upicId/share_uid`,
-        then fall back to dynamic DOM analysis only when needed.
-        """
-        logging.info("🤖 动态页先尝试静态HTML/JSON回退...")
-        initial_share_params = self._extract_share_query_params(url)
-        is_share_shell = (
-            '818ps.com/u/' in (url or '').lower()
-            and not initial_share_params.get('share_id')
-        )
-
-        if is_share_shell:
-            browser_resolved_result = await self._try_extract_from_browser_resolved_share_url(url)
-            if browser_resolved_result:
-                return browser_resolved_result
-
-        static_result = await self._extract_dynamic_page_without_browser(url)
-        if static_result:
-            static_image_url = static_result.get('imageUrl')
-            if not is_share_shell or not static_image_url or self._is_design_page_candidate(static_image_url):
-                return static_result
-
-            logging.warning(
-                f"⚠️ 818ps /u/ 静态回退命中了非设计稿资源，继续走浏览器解析链路: {static_image_url}"
-            )
-
-        browser_resolved_result = await self._try_extract_from_browser_resolved_share_url(url)
-        if browser_resolved_result:
-            return browser_resolved_result
-
-        try:
-            from core.browser_service import BrowserService
-
-            browser_service = BrowserService()
-            dynamic_data = await browser_service.extract_dynamic_content(url)
-
-            if not dynamic_data:
-                return None
-
-            initial_share_params = self._extract_share_query_params(url)
-            resolved_dynamic_url = (
-                dynamic_data.get('resolvedUrl')
-                or dynamic_data.get('currentUrl')
-                or dynamic_data.get('finalUrl')
-            )
-            if isinstance(resolved_dynamic_url, str):
-                resolved_dynamic_url = resolved_dynamic_url.strip()
-            else:
-                resolved_dynamic_url = None
-
-            if (
-                resolved_dynamic_url
-                and resolved_dynamic_url != url
-                and not initial_share_params.get('share_id')
-            ):
-                resolved_share_params = self._extract_share_query_params(resolved_dynamic_url)
-                if resolved_share_params.get('share_id'):
-                    logging.info(
-                        "🔁 动态渲染过程中获取到编辑器最终地址，回退官方分享 API: "
-                        f"{resolved_dynamic_url}"
-                    )
-                    share_api_result = await self._extract_from_share_api(resolved_dynamic_url)
-                    if share_api_result:
-                        logging.info("✅ 动态渲染结果成功补齐分享参数并命中官方分享 API")
-                        return share_api_result
-
-            return await self._analyze_dynamic_data(dynamic_data, url)
-        except Exception as e:
-            logging.warning(f"⚠️ 浏览器动态抓取失败，动态页回退结束: {e}")
-            return None
+        # Compatibility entry point; all 818ps browser work has one task owner.
+        return await self.extract_image(url)
 
     async def close(self):
         """关闭资源"""

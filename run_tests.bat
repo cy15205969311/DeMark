@@ -1,26 +1,41 @@
 @echo off
-chcp 65001 >nul
+setlocal
+
+set "PROJECT_ROOT=%~dp0"
+set "VENV_PYTHON=%PROJECT_ROOT%\.venv\Scripts\python.exe"
+set "PYTHON310=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
+set "PYTHON_EXE=python"
+
+if exist "%VENV_PYTHON%" (
+    set "PYTHON_EXE=%VENV_PYTHON%"
+) else if exist "%PYTHON310%" (
+    set "PYTHON_EXE=%PYTHON310%"
+)
+
 echo ========================================
-echo 运行项目测试
+echo Running project tests
 echo ========================================
 echo.
 
-:: 检查pytest是否安装
-pip show pytest >nul 2>&1
-if %errorlevel% neq 0 (
-    echo 📦 安装测试依赖...
-    pip install pytest pytest-asyncio
-)
-
-:: 运行测试
-echo 🧪 运行基础功能测试...
-python -m pytest tests/test_basic.py -v
-
-if %errorlevel% neq 0 (
-    echo ❌ 测试失败
-    pause
+"%PYTHON_EXE%" --version
+if errorlevel 1 (
+    echo Python is not available.
     exit /b 1
 )
 
-echo ✅ 测试通过
-pause
+"%PYTHON_EXE%" -m pip show pytest >nul 2>&1
+if errorlevel 1 (
+    echo Installing test dependencies...
+    "%PYTHON_EXE%" -m pip install pytest pytest-asyncio
+    if errorlevel 1 exit /b 1
+)
+
+echo Running baseline tests...
+"%PYTHON_EXE%" -m pytest tests/test_basic.py -v
+if errorlevel 1 (
+    echo Tests failed.
+    exit /b 1
+)
+
+echo Tests passed.
+exit /b 0

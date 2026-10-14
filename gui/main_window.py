@@ -13,11 +13,15 @@ import sys
 import os
 import webbrowser
 import json
+from pathlib import Path
+
+from PIL import Image, ImageOps
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.image_extractor import ImageExtractor
+from gui.tutorial_content import BEGINNER_TUTORIALS
 from utils.downloader import ImageDownloader
 
 class MainWindow:
@@ -49,6 +53,9 @@ class MainWindow:
         self.success_count = 0
         self.fail_count = 0
         self.warning_count = 0
+        self.tutorial_window = None
+        self._resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+        self._tutorial_image_refs = []
         
         # 创建界面
         self._create_widgets()
@@ -103,6 +110,19 @@ class MainWindow:
             text_color="#3B8ED0"
         )
         title_label.pack(side="left")
+
+        tutorial_btn = ctk.CTkButton(
+            title_frame,
+            text="📘 新手教程",
+            command=self._show_beginner_tutorial,
+            width=120,
+            height=34,
+            corner_radius=8,
+            font=("Microsoft YaHei UI", 11, "bold"),
+            fg_color="#355c7d",
+            hover_color="#27455d"
+        )
+        tutorial_btn.pack(side="right")
         
         # URL 输入区域
         input_frame = ctk.CTkFrame(control_card, fg_color="transparent")
@@ -158,6 +178,337 @@ class MainWindow:
         )
         self.platform_segmented.pack(fill="x", pady=(0, 5))
         self.platform_segmented.set("🤖 自动")  # 默认选择自动
+
+    def _show_beginner_tutorial(self):
+        """显示带平台 Tab 的新手教程窗口。"""
+        if self.tutorial_window and self.tutorial_window.winfo_exists():
+            self.tutorial_window.lift()
+            self.tutorial_window.focus()
+            return
+
+        tutorial_window = ctk.CTkToplevel(self.root)
+        self.tutorial_window = tutorial_window
+        tutorial_window.title("新手教程")
+        tutorial_window.geometry("1080x760")
+        tutorial_window.minsize(920, 680)
+        tutorial_window.configure(fg_color="#1a1a1a")
+        tutorial_window.transient(self.root)
+        tutorial_window.protocol("WM_DELETE_WINDOW", self._close_tutorial_window)
+
+        tutorial_window.grid_columnconfigure(0, weight=1)
+        tutorial_window.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(
+            tutorial_window,
+            fg_color="#2b2b2b",
+            corner_radius=10
+        )
+        header.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 10))
+        header.grid_columnconfigure(0, weight=1)
+
+        title_label = ctk.CTkLabel(
+            header,
+            text="📘 新手教程",
+            font=("Microsoft YaHei UI", 20, "bold"),
+            text_color="#3B8ED0",
+            anchor="w"
+        )
+        title_label.grid(row=0, column=0, sticky="w", padx=20, pady=(18, 6))
+
+        subtitle_label = ctk.CTkLabel(
+            header,
+            text="每个平台都有单独教程页。当前版本会优先展示真实操作截图；如果资源缺失，会自动回退为说明卡片。",
+            font=("Microsoft YaHei UI", 11),
+            text_color="gray75",
+            anchor="w",
+            justify="left",
+            wraplength=920
+        )
+        subtitle_label.grid(row=1, column=0, sticky="w", padx=20, pady=(0, 18))
+
+        tabview = ctk.CTkTabview(
+            tutorial_window,
+            fg_color="#232323",
+            segmented_button_fg_color="#303030",
+            segmented_button_selected_color="#1f538d",
+            segmented_button_selected_hover_color="#14375e",
+            corner_radius=10
+        )
+        tabview.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+
+        for platform_name, tutorial in BEGINNER_TUTORIALS.items():
+            tab = tabview.add(platform_name)
+            scroll = ctk.CTkScrollableFrame(
+                tab,
+                fg_color="#1e1e1e",
+                corner_radius=8,
+                scrollbar_button_color="#1f538d",
+                scrollbar_button_hover_color="#14375e"
+            )
+            scroll.pack(fill="both", expand=True, padx=12, pady=12)
+            self._populate_tutorial_tab(scroll, tutorial)
+
+        first_tab = next(iter(BEGINNER_TUTORIALS), None)
+        if first_tab:
+            tabview.set(first_tab)
+
+    def _close_tutorial_window(self):
+        """关闭教程窗口并清理引用。"""
+        if self.tutorial_window and self.tutorial_window.winfo_exists():
+            self.tutorial_window.destroy()
+        self.tutorial_window = None
+        self._tutorial_image_refs = []
+
+    def _populate_tutorial_tab(self, parent, tutorial: Dict):
+        """根据教程配置渲染单个平台页。"""
+        accent = tutorial.get("accent", "#3B8ED0")
+
+        hero = ctk.CTkFrame(parent, fg_color="#262626", corner_radius=12)
+        hero.pack(fill="x", pady=(0, 12))
+
+        badge_label = ctk.CTkLabel(
+            hero,
+            text=tutorial.get("badge", "平台教程"),
+            font=("Microsoft YaHei UI", 10, "bold"),
+            text_color="#101010",
+            fg_color=accent,
+            corner_radius=10,
+            padx=10,
+            pady=4
+        )
+        badge_label.pack(anchor="w", padx=18, pady=(16, 10))
+
+        summary_label = ctk.CTkLabel(
+            hero,
+            text=tutorial.get("summary", ""),
+            font=("Microsoft YaHei UI", 12),
+            text_color="gray88",
+            anchor="w",
+            justify="left",
+            wraplength=880
+        )
+        summary_label.pack(fill="x", padx=18, pady=(0, 16))
+
+        self._create_tutorial_section(
+            parent,
+            title="支持链接",
+            lines=tutorial.get("supported_links", []),
+            accent=accent,
+            numbered=False
+        )
+        self._create_tutorial_section(
+            parent,
+            title="操作步骤",
+            lines=tutorial.get("steps", []),
+            accent=accent,
+            numbered=True
+        )
+        self._create_tutorial_section(
+            parent,
+            title="新手提醒",
+            lines=tutorial.get("tips", []),
+            accent=accent,
+            numbered=False
+        )
+
+        self._create_tutorial_visual_section(parent, tutorial, accent)
+
+    def _create_tutorial_visual_section(self, parent, tutorial: Dict, accent: str):
+        """优先渲染真实教程截图，缺图时回退到文字占位。"""
+        screenshots = tutorial.get("screenshots", [])
+        placeholders = tutorial.get("placeholders", [])
+
+        visual_section = ctk.CTkFrame(parent, fg_color="#262626", corner_radius=12)
+        visual_section.pack(fill="x", pady=(0, 12))
+
+        has_screenshots = bool(screenshots)
+        section_title = "🖼️ 教程截图" if has_screenshots else "🖼️ 教程图片占位"
+        section_subtitle = (
+            "下面展示的是实际操作截图，方便新手直接对照平台页面和 DeMark 提取结果。"
+            if has_screenshots
+            else "当前版本先用占位说明顶住，后续你可以把这里替换成真实截图、GIF 或标注图。"
+        )
+
+        title_label = ctk.CTkLabel(
+            visual_section,
+            text=section_title,
+            font=("Microsoft YaHei UI", 14, "bold"),
+            text_color=accent,
+            anchor="w"
+        )
+        title_label.pack(fill="x", padx=18, pady=(16, 6))
+
+        subtitle_label = ctk.CTkLabel(
+            visual_section,
+            text=section_subtitle,
+            font=("Microsoft YaHei UI", 11),
+            text_color="gray70",
+            anchor="w",
+            justify="left",
+            wraplength=880
+        )
+        subtitle_label.pack(fill="x", padx=18, pady=(0, 12))
+
+        rendered_screenshot = False
+        for screenshot in screenshots:
+            rendered_screenshot = self._create_tutorial_screenshot_card(
+                visual_section,
+                screenshot,
+                accent
+            ) or rendered_screenshot
+
+        if rendered_screenshot:
+            return
+
+        for placeholder in placeholders:
+            self._create_tutorial_placeholder(visual_section, placeholder, accent)
+
+    def _create_tutorial_screenshot_card(self, parent, screenshot: Dict, accent: str) -> bool:
+        """渲染单张教程截图卡片。"""
+        image_path = self._get_tutorial_asset_path(screenshot.get("filename", ""))
+        image = self._load_tutorial_image(image_path)
+        if image is None:
+            return False
+
+        screenshot_card = ctk.CTkFrame(parent, fg_color="#2f2f2f", corner_radius=10)
+        screenshot_card.pack(fill="x", padx=18, pady=(0, 12))
+
+        title_label = ctk.CTkLabel(
+            screenshot_card,
+            text=screenshot.get("title", "教程截图"),
+            font=("Microsoft YaHei UI", 12, "bold"),
+            text_color=accent,
+            anchor="w"
+        )
+        title_label.pack(fill="x", padx=16, pady=(14, 10))
+
+        image_label = ctk.CTkLabel(
+            screenshot_card,
+            text="",
+            image=image
+        )
+        image_label.pack(fill="x", padx=16, pady=(0, 12))
+
+        description_label = ctk.CTkLabel(
+            screenshot_card,
+            text=screenshot.get("description", ""),
+            font=("Microsoft YaHei UI", 11),
+            text_color="gray86",
+            anchor="w",
+            justify="left",
+            wraplength=840
+        )
+        description_label.pack(fill="x", padx=16, pady=(0, 6))
+
+        hint_label = ctk.CTkLabel(
+            screenshot_card,
+            text=screenshot.get("hint", ""),
+            font=("Microsoft YaHei UI", 10),
+            text_color="gray65",
+            anchor="w",
+            justify="left",
+            wraplength=840
+        )
+        hint_label.pack(fill="x", padx=16, pady=(0, 14))
+
+        self._tutorial_image_refs.append(image)
+        return True
+
+    def _load_tutorial_image(self, image_path: Path) -> Optional[ctk.CTkImage]:
+        """加载并缩放教程截图。"""
+        if not image_path.exists():
+            logging.warning("Tutorial screenshot missing: %s", image_path)
+            return None
+
+        try:
+            with Image.open(image_path) as source_image:
+                fitted_image = ImageOps.exif_transpose(source_image).convert("RGBA")
+        except OSError:
+            logging.exception("Failed to load tutorial screenshot: %s", image_path)
+            return None
+
+        max_width = 840
+        max_height = 480
+        width, height = fitted_image.size
+        scale = min(max_width / width, max_height / height, 1.0)
+        display_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+
+        return ctk.CTkImage(
+            light_image=fitted_image,
+            dark_image=fitted_image,
+            size=display_size
+        )
+
+    def _get_tutorial_asset_path(self, filename: str) -> Path:
+        """兼容源码运行和打包运行的教程资源路径。"""
+        return self._resource_root / "gui" / "assets" / "tutorials" / filename
+
+    def _create_tutorial_section(self, parent, title: str, lines: List[str], accent: str, numbered: bool):
+        """渲染教程中的文本段落。"""
+        section = ctk.CTkFrame(parent, fg_color="#262626", corner_radius=12)
+        section.pack(fill="x", pady=(0, 12))
+
+        title_label = ctk.CTkLabel(
+            section,
+            text=f"• {title}",
+            font=("Microsoft YaHei UI", 14, "bold"),
+            text_color=accent,
+            anchor="w"
+        )
+        title_label.pack(fill="x", padx=18, pady=(16, 8))
+
+        if numbered:
+            section_text = "\n".join(f"{index + 1}. {line}" for index, line in enumerate(lines))
+        else:
+            section_text = "\n".join(f"• {line}" for line in lines)
+
+        body_label = ctk.CTkLabel(
+            section,
+            text=section_text,
+            font=("Microsoft YaHei UI", 11),
+            text_color="gray85",
+            anchor="w",
+            justify="left",
+            wraplength=880
+        )
+        body_label.pack(fill="x", padx=18, pady=(0, 16))
+
+    def _create_tutorial_placeholder(self, parent, placeholder: Dict, accent: str):
+        """渲染单个教程图片占位块。"""
+        placeholder_card = ctk.CTkFrame(parent, fg_color="#2f2f2f", corner_radius=10, height=132)
+        placeholder_card.pack(fill="x", padx=18, pady=(0, 12))
+        placeholder_card.pack_propagate(False)
+
+        title_label = ctk.CTkLabel(
+            placeholder_card,
+            text=placeholder.get("title", "占位图"),
+            font=("Microsoft YaHei UI", 12, "bold"),
+            text_color=accent,
+            anchor="w"
+        )
+        title_label.pack(fill="x", padx=16, pady=(14, 6))
+
+        description_label = ctk.CTkLabel(
+            placeholder_card,
+            text=placeholder.get("description", ""),
+            font=("Microsoft YaHei UI", 11),
+            text_color="gray86",
+            anchor="w",
+            justify="left",
+            wraplength=840
+        )
+        description_label.pack(fill="x", padx=16, pady=(0, 6))
+
+        hint_label = ctk.CTkLabel(
+            placeholder_card,
+            text=placeholder.get("hint", ""),
+            font=("Microsoft YaHei UI", 10),
+            text_color="gray65",
+            anchor="w",
+            justify="left",
+            wraplength=840
+        )
+        hint_label.pack(fill="x", padx=16, pady=(0, 14))
     
     def _create_result_gallery(self):
         """创建中部结果画廊"""

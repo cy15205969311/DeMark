@@ -33,19 +33,20 @@ class URLParser:
         优先处理短链接解析，确保获取完整参数
         """
         try:
-            logging.info(f"🔍 开始解析分享链接: {url}")
+            log = logging.debug if any(host in url.lower() for host in ('818ps.com', 'tuguaishou.com')) else logging.info
+            log(f"🔍 开始解析分享链接: {url}")
             
             # 步骤1: 清理URL，移除多余文本
             clean_url = self._clean_url(url)
-            logging.info(f"🧹 清理后URL: {clean_url}")
+            log(f"🧹 清理后URL: {clean_url}")
             
             # 步骤2: 检测平台类型
             platform = self._detect_platform(clean_url)
-            logging.info(f"🎯 检测到平台: {platform}")
+            log(f"🎯 检测到平台: {platform}")
 
             # 818ps /u/ 分享页现在更像前端壳子，保留原始 URL 交给本地渲染提取更稳定
             if platform == "818ps" and self._is_818ps_user_share_link(clean_url):
-                logging.info("🎨 检测到818ps /u/ 分享页，跳过短链跳转解析，保留原始分享页入口")
+                logging.debug("818ps /u/ 分享页保留原始入口")
                 pic_id, upic_id = self._extract_ids_from_url(clean_url)
                 return {
                     'success': True,
@@ -346,7 +347,8 @@ class URLParser:
             url = http_match.group(0)
         
         # URL解码
-        url = unquote(url)
+        if not any(host in url.lower() for host in ('818ps.com', 'tuguaishou.com')):
+            url = unquote(url)
         
         return url.strip()
     
@@ -370,7 +372,7 @@ class URLParser:
     def _parse_818ps_share_url(self, url: str, original_url: str) -> Dict:
         """解析818ps分享链接"""
         try:
-            logging.info("🎨 解析图怪兽分享链接...")
+            logging.debug("解析图怪兽分享链接")
             
             # 直接返回解析结果，让后续流程处理
             return {

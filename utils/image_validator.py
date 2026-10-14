@@ -8,6 +8,8 @@ import logging
 import re
 import socket
 import threading
+import time
+import hashlib
 import requests
 import urllib3
 from typing import Optional, Dict
@@ -18,7 +20,7 @@ class ImageValidator:
     图片URL验证器 - 防盗链绕过版
     解决CDN拒绝访问和超时问题
     """
-    
+
     # 标准请求头 - 绕过防盗链的关键
     DEFAULT_HEADERS = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -32,19 +34,41 @@ class ImageValidator:
         'Sec-Fetch-Mode': 'no-cors',
         'Sec-Fetch-Site': 'cross-site',
     }
-    
+
     ASYNC_HEAD_TIMEOUT = 2
     ASYNC_RANGE_TIMEOUT = 2
     SYNC_TIMEOUT = 2
     SYNC_FALLBACK_CONCURRENCY = 4
+    POSITIVE_CACHE_TTL = 600
+    NEGATIVE_CACHE_TTL = 120
 
-    def __init__(self):
+    def __init__(self, verbose: bool = True):
+        self._log_details = logging.info if verbose else logging.debug
+        self._log_validation_failure = logging.warning if verbose else logging.debug
         self.session = None
         self.sync_session = None
         self.sync_fallback_semaphore = threading.BoundedSemaphore(self.SYNC_FALLBACK_CONCURRENCY)
-        
+        self.validation_cache: Dict[str, tuple[bool, float]] = {}
+
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self._init_sync_session()
+
+    def _get_cached_validation_result(self, image_url: str) -> Optional[bool]:
+        cache_entry = self.validation_cache.get(image_url)
+        if not cache_entry:
+            return None
+
+        is_valid, expires_at = cache_entry
+        if time.time() >= expires_at:
+            self.validation_cache.pop(image_url, None)
+            return None
+
+        self._log_details(f"⚡ 命中图片校验缓存: {image_url}")
+        return is_valid
+
+    def _store_validation_result(self, image_url: str, is_valid: bool) -> None:
+        ttl = self.POSITIVE_CACHE_TTL if is_valid else self.NEGATIVE_CACHE_TTL
+        self.validation_cache[image_url] = (is_valid, time.time() + ttl)
 
     def _init_sync_session(self):
         """初始化同步会话"""
@@ -52,7 +76,7 @@ class ImageValidator:
         self.sync_session.headers.update(self.DEFAULT_HEADERS)
         self.sync_session.verify = False  # 忽略SSL证书验证
         self.sync_session.timeout = self.SYNC_TIMEOUT
-    
+
     async def _init_async_session(self):
         """初始化异步会话 - 强制IPv4 + 快速熔断"""
         if self.session and not self.session.closed:
@@ -72,49 +96,65 @@ class ImageValidator:
                     ttl_dns_cache=300,      # DNS缓存时间
                     use_dns_cache=True,     # 启用DNS缓存
                 )
-                
+
                 # 快速熔断 - 5秒总超时
                 timeout = aiohttp.ClientTimeout(total=self.ASYNC_HEAD_TIMEOUT + self.ASYNC_RANGE_TIMEOUT, connect=2)
-                
+
                 self.session = aiohttp.ClientSession(
                     connector=connector,
                     timeout=timeout,
                     headers=self.DEFAULT_HEADERS  # 使用标准防盗链头
                 )
-                
-                logging.info("✅ 异步会话初始化成功 (快速熔断模式)")
-                
+
+                self._log_details("✅ 异步会话初始化成功 (快速熔断模式)")
+
             except Exception as e:
                 logging.warning(f"⚠️ 异步会话初始化失败: {e}")
                 self.session = None
-    
-    async def validate_image_url(self, image_url: str) -> bool:
+
+    async def validate_image_url(self, image_url: str, request_headers: Optional[Dict] = None) -> bool:
         """
         验证图片URL - 快速验证模式
         使用防盗链头和快速熔断机制
         """
         try:
-            logging.info(f"🔍 快速验证图片URL: {image_url}")
-            
+            cache_key = image_url
+            if request_headers:
+                context = repr(sorted((key.lower(), value) for key, value in request_headers.items()))
+                cache_key += '#' + hashlib.sha256(context.encode()).hexdigest()
+            cached_result = self._get_cached_validation_result(cache_key)
+            if cached_result is not None:
+                return cached_result
+
+            self._log_details(f"🔍 快速验证图片URL: {image_url}")
+
             # 使用统一的防盗链头
             headers = self._get_anti_hotlink_headers(image_url)
-            
+            if request_headers:
+                for key, value in request_headers.items():
+                    for existing in list(headers):
+                        if existing.lower() == key.lower():
+                            headers.pop(existing)
+                    headers[key] = value
+
             # 方法1: 异步验证 (优先) - 快速模式
             async_result = await self._validate_async_fast(image_url, headers)
             if async_result is not None:
+                self._store_validation_result(cache_key, async_result)
                 return async_result
-            
+
             # 方法2: 同步验证 (回退) - 快速模式
             if not self.sync_session:
                 self._init_sync_session()
-            logging.info("🔄 异步验证失败，快速同步验证...")
+            self._log_details("🔄 异步验证失败，快速同步验证...")
             sync_result = await self._validate_sync_fast_async(image_url, headers)
+            self._store_validation_result(cache_key, sync_result)
             return sync_result
-            
+
         except Exception as error:
             logging.warning(f"⚠️ 图片URL验证异常: {error}")
             return False
-    
+
     def _get_anti_hotlink_headers(self, image_url: str) -> dict:
         """
         获取防盗链绕过头 - 根据域名优化
@@ -122,10 +162,10 @@ class ImageValidator:
         try:
             parsed = urlparse(image_url)
             hostname = parsed.hostname.lower() if parsed.hostname else ''
-            
+
             # 基础防盗链头
             headers = self.DEFAULT_HEADERS.copy()
-            
+
             # 根据域名优化Referer
             if 'tuguaishou.com' in hostname:
                 headers['Referer'] = 'https://tuguaishou.com/'
@@ -146,9 +186,9 @@ class ImageValidator:
                 # 默认使用818ps作为Referer
                 headers['Referer'] = 'https://818ps.com/'
                 headers['Origin'] = 'https://818ps.com'
-            
+
             return headers
-            
+
         except Exception:
             return self.DEFAULT_HEADERS.copy()
 
@@ -192,24 +232,24 @@ class ImageValidator:
         file_size = self._extract_reported_size(headers)
         if file_size is not None:
             if file_size < 10240:
-                logging.warning(f"❌ 图片过小 ({file_size} bytes)，已丢弃: {image_url}")
+                self._log_validation_failure(f"❌ 图片过小 ({file_size} bytes)，已丢弃: {image_url}")
                 return False
-            logging.info(f"✅ {method} 验证成功 (大小: {file_size} bytes)")
+            self._log_details(f"✅ {method} 验证成功 (大小: {file_size} bytes)")
             return True
 
-        logging.info(f"✅ {method} 验证成功 (大小未知)")
+        self._log_details(f"✅ {method} 验证成功 (大小未知)")
         return True
-    
+
     async def _validate_async_fast(self, image_url: str, headers: dict) -> Optional[bool]:
         """
         快速异步验证 - 5秒熔断
         """
         try:
             await self._init_async_session()
-            
+
             if not self.session:
                 return None
-            
+
             # 快速HEAD请求 - 3秒超时
             try:
                 async with self.session.head(
@@ -221,7 +261,7 @@ class ImageValidator:
                     if self._is_valid_image_response(resp.status, resp.headers, image_url, "异步HEAD"):
                         return True
                     if resp.status == 404:
-                        logging.warning(f"❌ 图片不存在 (404): {image_url}")
+                        self._log_validation_failure(f"❌ 图片不存在 (404): {image_url}")
                         return False
             except asyncio.TimeoutError:
                 logging.debug(f"⏰ 异步HEAD超时: {image_url}")
@@ -241,15 +281,15 @@ class ImageValidator:
                     if self._is_valid_image_response(resp.status, resp.headers, image_url, "异步GET"):
                         return True
                     if resp.status == 404:
-                        logging.warning(f"❌ 图片不存在 (404): {image_url}")
+                        self._log_validation_failure(f"❌ 图片不存在 (404): {image_url}")
                         return False
             except asyncio.TimeoutError:
                 logging.debug(f"⏰ 异步GET超时: {image_url}")
             except Exception as e:
                 logging.debug(f"异步GET请求失败: {e}")
-            
+
             return None  # 异步验证失败，需要回退
-            
+
         except Exception as e:
             logging.debug(f"异步验证异常: {e}")
             return None
@@ -266,14 +306,14 @@ class ImageValidator:
         """
         with self.sync_fallback_semaphore:
             return self._validate_sync_fast(image_url, headers)
-    
+
     def _validate_sync_fast(self, image_url: str, headers: dict) -> bool:
         """
         快速同步验证 - 5秒熔断
         """
         try:
-            logging.info("🔄 执行快速同步验证...")
-            
+            self._log_details("🔄 执行快速同步验证...")
+
             # 快速HEAD请求 - 5秒超时
             try:
                 resp = self.sync_session.head(
@@ -285,7 +325,7 @@ class ImageValidator:
                 if self._is_valid_image_response(resp.status_code, resp.headers, image_url, "同步HEAD"):
                     return True
                 if resp.status_code == 404:
-                    logging.warning(f"❌ 图片不存在 (404): {image_url}")
+                    self._log_validation_failure(f"❌ 图片不存在 (404): {image_url}")
                     return False
             except requests.exceptions.Timeout:
                 logging.debug(f"⏰ 同步HEAD超时: {image_url}")
@@ -306,7 +346,7 @@ class ImageValidator:
                     if self._is_valid_image_response(resp.status_code, resp.headers, image_url, "同步GET"):
                         return True
                     if resp.status_code == 404:
-                        logging.warning(f"❌ 图片不存在 (404): {image_url}")
+                        self._log_validation_failure(f"❌ 图片不存在 (404): {image_url}")
                         return False
                 finally:
                     resp.close()
@@ -314,25 +354,25 @@ class ImageValidator:
                 logging.debug(f"⏰ 同步GET超时: {image_url}")
             except Exception as e:
                 logging.debug(f"同步GET请求失败: {e}")
-            
-            logging.warning("❌ 快速同步验证失败")
+
+            self._log_validation_failure("❌ 快速同步验证失败")
             return False
-            
+
         except Exception as e:
             logging.warning(f"⚠️ 快速同步验证异常: {e}")
             return False
-    
+
     async def close(self):
         """关闭会话"""
         try:
             if self.session:
                 await self.session.close()
-                logging.info("✅ 异步会话已关闭")
+                self._log_details("✅ 异步会话已关闭")
                 self.session = None
-            
+
             if self.sync_session:
                 self.sync_session.close()
-                logging.info("✅ 同步会话已关闭")
+                self._log_details("✅ 同步会话已关闭")
                 self.sync_session = None
         except Exception as e:
             logging.warning(f"⚠️ 会话关闭异常: {e}")

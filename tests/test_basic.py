@@ -194,6 +194,27 @@ class TestImageValidator:
         assert validator.session is None
         assert validator.sync_session is None
 
+    @pytest.mark.asyncio
+    async def test_validate_image_url_uses_short_term_cache(self, validator):
+        """同一 URL 的重复校验应优先命中缓存，避免反复发请求"""
+        call_state = {"async": 0}
+        test_url = "https://img.tuguaishou.com/user_preview_ue/cache-test.jpg?auth_key=test"
+
+        async def fake_async_validate(image_url, headers):
+            del image_url, headers
+            call_state["async"] += 1
+            return True
+
+        validator._validate_async_fast = fake_async_validate
+        validator._validate_sync_fast_async = fake_async_validate
+
+        first_result = await validator.validate_image_url(test_url)
+        second_result = await validator.validate_image_url(test_url)
+
+        assert first_result is True
+        assert second_result is True
+        assert call_state["async"] == 1
+
 class TestThirdPartyAPIGateway:
     """第三方 API 网关测试"""
 
@@ -382,7 +403,8 @@ class Test818psCrawler:
                     'https://img.tuguaishou.com/user_preview_ue/share_page2.jpg!l1600',
                 ],
                 'platform': '818ps',
-                'source': 'share_api_share_template'
+                'source': 'share_api_share_template',
+                'expectedPageCount': 2
             }
 
         async def fake_direct_build(upic_id, pic_id=None):
@@ -411,68 +433,38 @@ class Test818psCrawler:
         assert call_state['scrape'] == 0
 
     @pytest.mark.asyncio
-    async def test_share_link_falls_back_to_direct_build_after_share_api_miss(self):
-        """娴嬭瘯鍒嗕韩API鏈懡涓椂浠嶄細鍥為€€鍒癠pic 鐩磋繛绛栫暐"""
+    async def test_share_link_falls_back_to_browser_after_share_api_miss(self, monkeypatch):
+        from unittest.mock import AsyncMock
         crawler = Tuguaishou818psCrawler()
-        call_state = {
-            'share_api': 0,
-            'direct_build': 0,
-            'scrape': 0,
-        }
-
-        async def fake_share_api(url):
-            call_state['share_api'] += 1
-            return None
-
-        async def fake_direct_build(upic_id, pic_id=None):
-            call_state['direct_build'] += 1
-            return {
-                'imageUrl': f'https://img.818ps.com/user_preview_ue/{upic_id}.jpg',
-                'platform': '818ps',
-                'source': 'user_path_priority'
-            }
-
-        async def fake_scrape(url):
-            call_state['scrape'] += 1
-            return None
-
-        crawler._extract_from_share_api = fake_share_api
-        crawler._extract_with_upic_id_priority = fake_direct_build
-        crawler._scrape_webpage_enhanced = fake_scrape
-
-        result = await crawler.extract_image(
-            "https://ue.818ps.com/v4/?upicId=311210634&share_id=1783630&share_uid=24655456",
-            {'upic_id': '311210634'}
-        )
-
+        crawler._extract_from_share_api = AsyncMock(return_value=None)
+        crawler._extract_with_upic_id_priority = AsyncMock()
+        crawler.session = FakeAiohttpSession('<html></html>')
+        monkeypatch.setattr(BrowserService, 'open_818ps_page', AsyncMock(return_value={
+            'currentUrl': 'https://ue.818ps.com/v4/?upicId=1&share_id=2',
+            'networkData': [{'pageCount': 1, 'preview': ['https://img.tuguaishou.com/user_preview_ue/page1.jpg']}]
+        }))
+        monkeypatch.setattr(BrowserService, 'close', AsyncMock())
+        crawler.validator.validate_image_url = AsyncMock(return_value=True)
+        result = await crawler.extract_image('https://ue.818ps.com/v4/?upicId=1&share_id=2')
+        assert result['completenessStatus'] == 'complete'
+        crawler._extract_from_share_api.assert_awaited_once()
+        crawler._extract_with_upic_id_priority.assert_not_awaited()
+        BrowserService.open_818ps_page.assert_awaited_once()
         await crawler.close()
 
-        assert result is not None
-        assert result['source'] == 'user_path_priority'
-        assert call_state['share_api'] == 1
-        assert call_state['direct_build'] == 1
-        assert call_state['scrape'] == 0
-
     @pytest.mark.asyncio
-    async def test_dynamic_page_uses_static_fallback_before_browser(self):
-        """测试动态页先走静态HTML回退，不把成功率全部压在浏览器上"""
+    async def test_dynamic_page_uses_complete_static_data_before_browser(self, monkeypatch):
+        from unittest.mock import AsyncMock
         crawler = Tuguaishou818psCrawler()
-
-        async def fake_static(url):
-            return {
-                'imageUrl': 'https://img.818ps.com/user_preview_ue/311210634.jpg',
-                'platform': '818ps',
-                'source': 'meta_image'
-            }
-
-        crawler._extract_dynamic_page_without_browser = fake_static
-
-        result = await crawler._extract_dynamic_page(
-            "https://ue.818ps.com/v4/?upicId=311210634&share_id=1783630"
-        )
-
-        assert result is not None
-        assert result['source'] == 'meta_image'
+        crawler._extract_from_share_api = AsyncMock(return_value=None)
+        crawler.session = FakeAiohttpSession('<script type="application/json">{"pageCount":1,"preview":["https://img.tuguaishou.com/user_preview_ue/page1.jpg"]}</script>')
+        crawler.validator.validate_image_url = AsyncMock(return_value=True)
+        monkeypatch.setattr(BrowserService, 'open_818ps_page', AsyncMock())
+        result = await crawler._extract_dynamic_page('https://ue.818ps.com/v4/?upicId=1&share_id=2')
+        assert result['source'] == 'embedded_json'
+        assert result['completenessStatus'] == 'complete'
+        BrowserService.open_818ps_page.assert_not_awaited()
+        await crawler.close()
 
     @pytest.mark.asyncio
     async def test_first_valid_candidate_does_not_wait_for_slower_ones(self):
@@ -639,6 +631,28 @@ class Test818psCrawler:
             ("team_share_get_templ", [page_one, page_two, page_three, page_four])
         ]
 
+    def test_build_818ps_variant_candidates_prioritizes_auth_preserving_urls(self):
+        """818ps 页图候选应优先尝试保留 auth_key 的高命中变体"""
+        crawler = Tuguaishou818psCrawler()
+        original_url = (
+            "https://img.tuguaishou.com/user_preview_ue/2026-04-02/"
+            "23001930d43d4c2293d75121463a1f73_47636_1.jpg!l1000_b?auth_key=test"
+        )
+
+        candidates = crawler._build_818ps_variant_candidates(original_url, prefer_variants=True)
+
+        assert candidates[0] == (
+            "https://img.tuguaishou.com/user_preview_ue/2026-04-02/"
+            "23001930d43d4c2293d75121463a1f73_47636_1.jpg?auth_key=test"
+        )
+        assert candidates.index(
+            "https://img.tuguaishou.com/user_preview_ue/2026-04-02/"
+            "23001930d43d4c2293d75121463a1f73_47636_1.jpg"
+        ) > candidates.index(
+            "https://img.tuguaishou.com/user_preview_ue/2026-04-02/"
+            "23001930d43d4c2293d75121463a1f73_47636_1.jpg?auth_key=test"
+        )
+
     @pytest.mark.asyncio
     async def test_extract_from_share_api_upgrades_watermarked_urls_and_prefers_full_group(self):
         """分享 API 结果应优先升级为无水印页图，并继续寻找更完整的页集"""
@@ -706,7 +720,8 @@ class Test818psCrawler:
         await crawler.close()
 
         assert result is not None
-        assert result["source"] == "share_api_team_share_get_templ"
+        assert "share_api_team_share_get_templ" in result["source"]
+        assert result["completenessStatus"] == "complete"
         assert result["imageUrls"] == expected_urls
         assert result["pageCount"] == 4
         assert all("!l1000_b" not in url for url in result["imageUrls"])
@@ -844,82 +859,30 @@ class Test818psCrawler:
         assert result["imageUrls"] == [page_one, page_two, page_three]
 
     @pytest.mark.asyncio
-    async def test_dynamic_share_shell_uses_browser_resolved_editor_url_for_share_api(self):
-        """测试 818ps /u/ 分享壳页会先用浏览器解析最终编辑器地址，再走官方分享 API 拿多页结果"""
+    async def test_dynamic_share_shell_reuses_browser_capture_for_share_api(self, monkeypatch):
+        from unittest.mock import AsyncMock, Mock
         crawler = Tuguaishou818psCrawler()
-        resolved_url = (
-            "https://ue.818ps.com/v4/?upicId=311361830"
-            "&share_uid=24655456&share_id=1786146"
-        )
-        call_state = {
-            "share_api": 0,
-            "resolve_url": 0,
-            "dynamic_browser": 0,
-            "analyze": 0,
-        }
+        crawler.session = FakeAiohttpSession('<html></html>')
+        resolved = 'https://ue.818ps.com/v4/?upicId=1&share_id=2&share_uid=3'
+        page = 'https://img.tuguaishou.com/user_preview_ue/page1.jpg'
+        crawler._extract_from_share_api = AsyncMock(return_value={
+            'pages': [{'page': 1, 'imageUrl': page}], 'imageUrls': [page],
+            'source': 'share_api_share_template', 'expectedPageCount': 1
+        })
+        monkeypatch.setattr(BrowserService, 'open_818ps_page', AsyncMock(return_value={'currentUrl': resolved}))
+        monkeypatch.setattr(BrowserService, 'capture_818ps_pages', AsyncMock())
+        monkeypatch.setattr(BrowserService, 'resolve_url_with_browser', Mock())
+        monkeypatch.setattr(BrowserService, 'close', AsyncMock())
+        result = await crawler._extract_dynamic_page('https://818ps.com/u/test')
+        assert result['completenessStatus'] == 'complete'
+        assert result['source'] == 'share_api_share_template'
+        crawler._extract_from_share_api.assert_awaited_once_with(resolved)
+        BrowserService.open_818ps_page.assert_awaited_once()
+        BrowserService.resolve_url_with_browser.assert_not_called()
+        BrowserService.capture_818ps_pages.assert_not_awaited()
+        BrowserService.close.assert_awaited_once()
+        await crawler.close()
 
-        async def fake_static(url):
-            del url
-            return {
-                "imageUrl": "https://img.tuguaishou.com/ips_index_hot_day/test.png!w170?auth_key=test",
-                "platform": "818ps",
-                "source": "regex_image_search",
-            }
-
-        async def fake_share_api(url):
-            call_state["share_api"] += 1
-            assert url == resolved_url
-            return {
-                "imageUrl": "https://img.tuguaishou.com/user_preview_ue/page1.jpg!l1600?auth_key=test",
-                "imageUrls": [
-                    "https://img.tuguaishou.com/user_preview_ue/page1.jpg!l1600?auth_key=test",
-                    "https://img.tuguaishou.com/user_preview_ue/page2.jpg!l1600?auth_key=test",
-                    "https://img.tuguaishou.com/user_preview_ue/page3.jpg!l1600?auth_key=test",
-                    "https://img.tuguaishou.com/user_preview_ue/page4.jpg!l1600?auth_key=test",
-                ],
-                "platform": "818ps",
-                "source": "share_api_share_template",
-            }
-
-        async def fake_analyze(dynamic_data, original_url):
-            del dynamic_data, original_url
-            call_state["analyze"] += 1
-            return None
-
-        original_resolve_url = BrowserService.resolve_url_with_browser
-        original_extract_dynamic_content = BrowserService.extract_dynamic_content
-
-        def fake_resolve_url(self, url, headless=True, wait_seconds=5.0):
-            del self, url, headless, wait_seconds
-            call_state["resolve_url"] += 1
-            return resolved_url
-
-        async def fake_extract_dynamic_content(self, url, headless=True):
-            del self, url, headless
-            call_state["dynamic_browser"] += 1
-            return {}
-
-        crawler._extract_dynamic_page_without_browser = fake_static
-        crawler._extract_from_share_api = fake_share_api
-        crawler._analyze_dynamic_data = fake_analyze
-        BrowserService.resolve_url_with_browser = fake_resolve_url
-        BrowserService.extract_dynamic_content = fake_extract_dynamic_content
-
-        try:
-            result = await crawler._extract_dynamic_page(
-                "https://818ps.com/u/002dKC0v-1?user_source=r1537041"
-            )
-        finally:
-            BrowserService.resolve_url_with_browser = original_resolve_url
-            BrowserService.extract_dynamic_content = original_extract_dynamic_content
-            await crawler.close()
-
-        assert result is not None
-        assert result["source"] == "share_api_share_template"
-        assert call_state["resolve_url"] == 1
-        assert call_state["share_api"] == 1
-        assert call_state["dynamic_browser"] == 0
-        assert call_state["analyze"] == 0
 
 class TestResultNormalization:
     """提取结果归一化测试"""

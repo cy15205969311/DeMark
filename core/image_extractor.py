@@ -4,6 +4,7 @@
 """
 import asyncio
 import logging
+import time
 from typing import Dict, Optional, List
 from urllib.parse import urlparse, parse_qs
 
@@ -60,19 +61,94 @@ class ImageExtractor:
         if not result or result.get('status') == 'manual_guidance':
             return result
 
+        if result.get('platform') == '818ps':
+            # 818ps pages carry identity, including gaps and equal URLs on distinct pages.
+            normalized = dict(result)
+            pages = [dict(page) for page in result.get('pages', [])
+                     if isinstance(page, dict) and page.get('imageUrl')]
+            if not pages:
+                urls = result.get('imageUrls') or result.get('images') or [result.get('imageUrl')]
+                pages = [{'page': index, 'imageUrl': url}
+                         for index, url in enumerate(urls, 1) if isinstance(url, str) and url]
+            pages.sort(key=lambda page: int(page['page']))
+            urls = [page['imageUrl'] for page in pages]
+            expected = result.get('expectedPageCount')
+            missing = [page for page in range(1, (expected or 0) + 1)
+                       if page not in {int(item['page']) for item in pages if item.get('identityConfirmed', True)}]
+            status = ('complete' if not missing and len(pages) == expected else 'partial') if expected else 'unknown'
+            normalized.update(pages=pages, imageUrls=urls, images=list(urls),
+                              imageUrl=urls[0] if urls else None, pageCount=len(pages),
+                              isMultiPage=len(pages) > 1, completenessStatus=status,
+                              expectedPageCount=expected, missingPages=missing)
+            normalized.setdefault('thumbnailUrl', urls[0] if urls else None)
+            return normalized
+
         normalized_result = dict(result)
         image_urls: List[str] = []
         seen = set()
 
-        for image_url in normalized_result.get('imageUrls', []) or []:
-            if isinstance(image_url, str) and image_url and image_url not in seen:
-                image_urls.append(image_url)
-                seen.add(image_url)
+        def add_image_url(candidate_url: object) -> None:
+            if not isinstance(candidate_url, str):
+                return
 
-        primary_url = normalized_result.get('imageUrl')
-        if isinstance(primary_url, str) and primary_url and primary_url not in seen:
-            image_urls.insert(0, primary_url)
-            seen.add(primary_url)
+            normalized_url = candidate_url.strip()
+            if not normalized_url or normalized_url in seen:
+                return
+
+            image_urls.append(normalized_url)
+            seen.add(normalized_url)
+
+        def extract_item_url(item: object) -> Optional[str]:
+            if isinstance(item, str):
+                return item.strip()
+            if not isinstance(item, dict):
+                return None
+
+            for key in ('imageUrl', 'url', 'src'):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+            return None
+
+        page_entries = []
+        for page in normalized_result.get('pages', []) or []:
+            if not isinstance(page, dict):
+                continue
+
+            page_url = extract_item_url(page)
+            if not page_url:
+                continue
+
+            page_number = page.get('page')
+            try:
+                parsed_page_number = int(page_number)
+            except (TypeError, ValueError):
+                parsed_page_number = None
+
+            page_entries.append((parsed_page_number, page_url))
+
+        numbered_pages = [
+            (page_number, page_url)
+            for page_number, page_url in page_entries
+            if page_number is not None
+        ]
+        if page_entries and len(numbered_pages) == len(page_entries):
+            page_entries = sorted(page_entries, key=lambda item: item[0])
+
+        for _, page_url in page_entries:
+            add_image_url(page_url)
+
+        for field_name in ('imageUrls', 'images'):
+            for item in normalized_result.get(field_name, []) or []:
+                add_image_url(extract_item_url(item))
+
+        if not image_urls:
+            add_image_url(extract_item_url(normalized_result.get('imageUrl')))
+
+        thumbnail_url = normalized_result.get('thumbnailUrl')
+        if not image_urls:
+            add_image_url(extract_item_url(thumbnail_url))
 
         if not image_urls:
             return normalized_result
@@ -86,20 +162,26 @@ class ImageExtractor:
 
         normalized_result['imageUrl'] = image_urls[0]
         normalized_result['imageUrls'] = image_urls
+        normalized_result['images'] = list(image_urls)
         normalized_result['pages'] = normalized_pages
         normalized_result['pageCount'] = len(image_urls)
         normalized_result['isMultiPage'] = len(image_urls) > 1
+        if not isinstance(thumbnail_url, str) or not thumbnail_url.strip():
+            normalized_result['thumbnailUrl'] = image_urls[0]
         return normalized_result
         
     async def extract_image(self, url: str, platform: str) -> Dict:
         """
         主提取函数 - 完全对应Node.js版本的extractImage函数
         """
-        logging.info(f"🚀 开始提取图片 - 平台: {platform}, URL: {url[:100]}")
+        started = time.monotonic()
+        log = logging.debug if platform == '818ps' or any(
+            host in url.lower() for host in ('818ps.com', 'tuguaishou.com')) else logging.info
+        log(f"🚀 开始提取图片 - 平台: {platform}, URL: {url[:100]}")
         
         try:
             # ========== 阶段0: URL解析和清理 ==========
-            logging.info("🔍 阶段0: 解析分享链接...")
+            log("🔍 阶段0: 解析分享链接...")
             parse_result = self.url_parser.parse_share_url(url)
             
             if parse_result.get('success'):
@@ -110,12 +192,26 @@ class ImageExtractor:
                 if platform == "auto" or platform == "Unknown":
                     platform = detected_platform
                 
-                logging.info(f"✅ URL解析成功: {processed_url}")
-                logging.info(f"🎯 检测到平台: {platform}")
+                log(f"✅ URL解析成功: {processed_url}")
+                log(f"🎯 检测到平台: {platform}")
             else:
                 processed_url = url
                 logging.warning(f"⚠️ URL解析失败，使用原URL: {parse_result.get('error', '')}")
             
+            if platform == '818ps':
+                # A gateway or generic Selenium single image cannot establish page completeness.
+                local_result = await self._extract_local(processed_url, platform, parse_result)
+                if local_result:
+                    local_result.setdefault('metadata', {})['totalMs'] = round((time.monotonic() - started) * 1000)
+                    return self._normalize_result_images({
+                        **local_result, 'platform': platform,
+                        'original_url': url, 'processed_url': processed_url
+                    })
+                return {'platform': platform, 'success': False, 'error': '818ps提取失败',
+                        'completenessStatus': 'unknown', 'expectedPageCount': None,
+                        'missingPages': [], 'pages': [], 'imageUrls': [], 'images': [],
+                        'imageUrl': None, 'thumbnailUrl': None, 'pageCount': 0, 'isMultiPage': False}
+
             # ========== 阶段1: 第三方API网关 (80%命中率) ==========
             if platform == 'Huaban':
                 logging.info("📡 阶段1: Huaban使用官方公开接口，跳过第三方API网关")
@@ -127,17 +223,24 @@ class ImageExtractor:
                 logging.info("📡 阶段1: 尝试第三方API网关...")
                 api_result = await self.third_party_api.extract_with_cache(processed_url, platform)
             
-            if api_result and api_result.get('success') and api_result.get('imageUrl'):
-                # 验证API返回的图片URL
-                if await self.validator.validate_image_url(api_result['imageUrl']):
-                    logging.info("✅ 【成功】第三方API网关返回结果")
-                    return self._normalize_result_images({
-                        **api_result,
-                        'source': 'api-gateway',
-                        'platform': platform,
-                        'original_url': url,
-                        'processed_url': processed_url
-                    })
+            deferred_api_result = None
+            if api_result and api_result.get('success'):
+                normalized_api_result = self._normalize_result_images({
+                    **api_result,
+                    'source': 'api-gateway',
+                    'platform': platform,
+                    'original_url': url,
+                    'processed_url': processed_url
+                })
+
+                api_image_url = normalized_api_result.get('imageUrl') if normalized_api_result else None
+                if api_image_url and await self.validator.validate_image_url(api_image_url):
+                    if platform == 'Chuangkit' and not normalized_api_result.get('isMultiPage'):
+                        logging.info("Chuangkit API returned a single image; defer it until local multi-page extraction completes")
+                        deferred_api_result = normalized_api_result
+                    else:
+                        logging.info("✅ 【成功】第三方API网关返回结果")
+                        return normalized_api_result
             
             # ========== 阶段2: 本地平台特定提取 ==========
             logging.info("🔍 阶段2: 尝试本地平台特定提取...")
@@ -151,22 +254,24 @@ class ImageExtractor:
                 }
             
             local_result = await self._extract_local(processed_url, platform, extracted_params)
+
+            if not local_result and deferred_api_result:
+                logging.info("Chuangkit local extraction did not yield a multi-page result; use deferred API fallback")
+                return deferred_api_result
             
             if local_result:
+                normalized_local_result = self._normalize_result_images({
+                    **local_result,
+                    'original_url': url,
+                    'processed_url': processed_url
+                })
+
                 if local_result.get('status') == 'preview_only':
                     logging.info("Huaban preview-only result returned")
-                    return self._normalize_result_images({
-                        **local_result,
-                        'original_url': url,
-                        'processed_url': processed_url
-                    })
+                    return normalized_local_result
                 if local_result.get('status') == 'preview_image':
                     logging.info("Huaban preview-image result returned")
-                    return self._normalize_result_images({
-                        **local_result,
-                        'original_url': url,
-                        'processed_url': processed_url
-                    })
+                    return normalized_local_result
                 # 检查是否是用户指导响应
                 if local_result.get('status') == 'manual_guidance':
                     logging.info("🤝 【用户指导】本地提取返回用户指导")
@@ -175,7 +280,11 @@ class ImageExtractor:
                         'original_url': url,
                         'processed_url': processed_url
                     })
-                elif local_result.get('imageUrl'):
+                elif normalized_local_result and normalized_local_result.get('imageUrl'):
+                    if platform == 'Chuangkit' and deferred_api_result and not normalized_local_result.get('isMultiPage'):
+                        logging.info("Chuangkit local extraction stayed single-page; use deferred API fallback")
+                        return deferred_api_result
+
                     logging.info("✅ 【成功】本地提取返回结果")
                     return self._normalize_result_images({
                         **local_result,
@@ -384,7 +493,7 @@ class ImageExtractor:
             提取结果字典或None
         """
         try:
-            logging.info(f"🔍 本地提取调度器: 平台={platform}")
+            (logging.debug if platform == '818ps' else logging.info)(f"🔍 本地提取调度器: 平台={platform}")
             
             if platform == '818ps':
                 return await self._extract_818ps(url, parsed_params)
@@ -416,22 +525,8 @@ class ImageExtractor:
             包含图片信息的字典或None
         """
         try:
-            logging.info(f"🎨 开始818ps本地提取: {url}")
+            logging.debug(f"开始818ps本地提取: {url}")
             
-            # 优先检查传入的 parsed_params
-            if parsed_params and parsed_params.get('pic_id') and parsed_params.get('upic_id'):
-                logging.info(f"🎯 使用预解析参数: picId={parsed_params['pic_id']}, upicId={parsed_params['upic_id']}")
-                
-                # 直接构建无水印URL列表（使用 img.818ps.com 等已知图床规则）
-                result = await self._build_818ps_urls_from_params(
-                    parsed_params['pic_id'], 
-                    parsed_params['upic_id']
-                )
-                if result:
-                    return result
-            
-            # 如果没有预解析参数或构建失败，使用爬虫进行网页抓取
-            logging.info("🌐 使用818ps爬虫进行网页抓取...")
             if '818ps' in self.crawlers:
                 crawler = self.crawlers['818ps']
                 return await crawler.extract_image(url, parsed_params)

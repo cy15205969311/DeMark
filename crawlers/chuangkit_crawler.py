@@ -50,13 +50,30 @@ class ChuangkitCrawler:
             session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), connector=connector)
 
             # 分享页往往是动态渲染，优先走动态抓取，避免静态 meta 误命中封面图。
+            static_candidate_urls = await self._collect_validated_static_candidates(session, url)
+            if len(static_candidate_urls) >= 2:
+                return self._build_result(
+                    static_candidate_urls,
+                    url,
+                    'static-scan',
+                    'static_candidate_scan',
+                    link_type,
+                    score=220
+                )
+
             result = await self._dynamic_scraping(url, link_type)
             if result:
                 return result
 
-            result = await self._static_scraping(session, url, link_type)
-            if result:
-                return result
+            if static_candidate_urls:
+                return self._build_result(
+                    [static_candidate_urls[0]],
+                    url,
+                    'static-fallback',
+                    'static_candidate_scan',
+                    link_type,
+                    score=180
+                )
 
             return None
 
@@ -75,68 +92,15 @@ class ChuangkitCrawler:
     ) -> Optional[Dict]:
         """静态抓取兜底，主要处理明确暴露的预览图。"""
         try:
-            async with session.get(url, headers=self.headers) as response:
-                if response.status != 200:
-                    return None
-                html_content = await response.text()
-
-            soup = BeautifulSoup(html_content, 'lxml')
-
-            meta_selectors = [
-                ('meta[property="og:image"]', 'content'),
-                ('meta[name="twitter:image"]', 'content'),
-                ('link[rel="image_src"]', 'href')
-            ]
-
-            for selector, attr in meta_selectors:
-                element = soup.select_one(selector)
-                if not element or not element.get(attr):
-                    continue
-
-                image_url = self._normalize_candidate_url(element[attr])
-                if not image_url or not self._is_chuangkit_design_candidate(image_url):
-                    continue
-
-                if await self.validator.validate_image_url(image_url):
-                    return self._build_result(
-                        [image_url],
-                        url,
-                        'meta',
-                        'meta_extraction',
-                        link_type,
-                        score=200
-                    )
-
-            selectors = [
-                'img[src*="chuangkit"]',
-                'img[src*="render_result"]',
-                '.design-preview img',
-                '.template-preview img',
-                '.share-preview img'
-            ]
-
-            candidate_urls: List[str] = []
-            for selector in selectors:
-                elements = soup.select(selector)
-                for element in elements:
-                    img_src = element.get('src') or element.get('data-src')
-                    if not img_src:
-                        continue
-                    image_url = self._normalize_candidate_url(
-                        img_src if img_src.startswith('http') else urljoin(url, img_src)
-                    )
-                    if image_url:
-                        candidate_urls.append(image_url)
-
-            valid_urls = await self._validate_urls_in_order(candidate_urls)
+            valid_urls = await self._collect_validated_static_candidates(session, url)
             if valid_urls:
                 return self._build_result(
-                    [valid_urls[0]],
+                    valid_urls if len(valid_urls) > 1 else [valid_urls[0]],
                     url,
-                    'dom',
-                    'dom_extraction',
+                    'static-scan' if len(valid_urls) > 1 else 'static-fallback',
+                    'static_candidate_scan',
                     link_type,
-                    score=180
+                    score=220 if len(valid_urls) > 1 else 180
                 )
 
             return None
@@ -144,6 +108,73 @@ class ChuangkitCrawler:
         except Exception as error:
             logging.debug(f"静态抓取失败: {error}")
             return None
+
+    async def _collect_validated_static_candidates(
+        self,
+        session: aiohttp.ClientSession,
+        url: str
+    ) -> List[str]:
+        """Collect and validate candidate preview URLs from static HTML."""
+        html_content = await self._fetch_html(session, url)
+        if not html_content:
+            return []
+
+        candidate_urls = self._collect_static_candidate_urls_from_html(url, html_content)
+        return await self._validate_urls_in_order(candidate_urls)
+
+    async def _fetch_html(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
+        """Fetch a Chuangkit page for static candidate extraction."""
+        async with session.get(url, headers=self.headers) as response:
+            if response.status != 200:
+                return None
+            return await response.text()
+
+    def _collect_static_candidate_urls_from_html(self, page_url: str, html_content: str) -> List[str]:
+        """Extract candidate preview URLs from meta, DOM, background images, and text."""
+        soup = BeautifulSoup(html_content, 'lxml')
+        candidate_urls: List[str] = []
+
+        def add_candidate(raw_url: Optional[str]) -> None:
+            if not raw_url:
+                return
+
+            normalized_url = self._normalize_candidate_url(urljoin(page_url, raw_url))
+            if not normalized_url or not self._is_chuangkit_design_candidate(normalized_url):
+                return
+
+            candidate_urls.append(normalized_url)
+
+        meta_selectors = [
+            ('meta[property="og:image"]', 'content'),
+            ('meta[name="twitter:image"]', 'content'),
+            ('link[rel="image_src"]', 'href'),
+        ]
+        for selector, attr in meta_selectors:
+            element = soup.select_one(selector)
+            if element:
+                add_candidate(element.get(attr))
+
+        for image in soup.select('img'):
+            for attr in ('src', 'data-src', 'data-original', 'data-url'):
+                add_candidate(image.get(attr))
+
+        for source in soup.select('source'):
+            source_value = source.get('srcset') or source.get('src')
+            if not source_value:
+                continue
+            for item in source_value.split(','):
+                add_candidate(item.strip().split()[0])
+
+        background_pattern = re.compile(r'url\((?P<quote>[\'"]?)(?P<url>[^)\'"]+)(?P=quote)\)', re.IGNORECASE)
+        for element in soup.select('[style*="background"]'):
+            style_text = element.get('style') or ''
+            for match in background_pattern.finditer(style_text):
+                add_candidate(match.group('url'))
+
+        for text_url in self._extract_urls_from_text(html_content):
+            add_candidate(text_url)
+
+        return self._dedupe_urls(candidate_urls)
 
     async def _dynamic_scraping(self, url: str, link_type: str) -> Optional[Dict]:
         """动态抓取，优先逐页提取套图，失败后退回旧版候选图选择。"""

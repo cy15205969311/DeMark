@@ -4,6 +4,35 @@ from crawlers.chuangkit_crawler import ChuangkitCrawler
 
 
 class TestChuangkitCrawler:
+    def test_collect_static_candidate_urls_from_html_extracts_meta_dom_background_and_text(self):
+        crawler = ChuangkitCrawler()
+        page_one = "https://pri-cdn-oss.chuangkit.com/svg_build/render_result/2026/04/02/page1?sign=1"
+        page_two = "https://pri-cdn-oss.chuangkit.com/svg_build/render_result/2026/04/02/page2?sign=2"
+        page_three = "https://pri-cdn-oss.chuangkit.com/svg_build/render_result/2026/04/02/page3?sign=3"
+
+        html_content = f"""
+        <html>
+          <head>
+            <meta property="og:image" content="{page_one}" />
+          </head>
+          <body>
+            <img src="{page_two}" />
+            <div style="background-image:url('{page_three}')"></div>
+            <img src="https://www.chuangkit.com/distheadless/img/share_header.png" />
+            <script>
+              window.__PREVIEW__ = "{page_one}";
+            </script>
+          </body>
+        </html>
+        """
+
+        result = crawler._collect_static_candidate_urls_from_html(
+            "https://www.chuangkit.com/sharedesign?d=test",
+            html_content,
+        )
+
+        assert result == [page_one, page_two, page_three]
+
     def test_candidate_filter_prefers_design_assets(self):
         crawler = ChuangkitCrawler()
 

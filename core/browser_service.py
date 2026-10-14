@@ -10,21 +10,58 @@ import subprocess
 import tempfile
 from typing import Optional, Dict, List, Any
 import time
+import asyncio
+import json
+import zipfile
+import base64
+from urllib.request import urlopen
+from urllib.parse import urlparse
 
 class BrowserService:
     """
     浏览器服务 - 增强版
     解决Chrome驱动配置冲突，支持多种Chrome安装路径
     """
+    URL_RESOLUTION_CACHE_TTL = 1800
+    _url_resolution_cache: Dict[str, tuple[str, float]] = {}
+    _driver_paths = {}
+    _chrome_versions = {}
     
     def __init__(self):
         self.driver = None
+        self._818ps_capture = {}
+        self._818ps_pending_responses = {}
+        self._818ps_request_headers = {}
+        self.request_id = None
         self.chrome_paths = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
             r"C:\Users\{}\AppData\Local\Google\Chrome\Application\chrome.exe".format(os.getenv('USERNAME', '')),
             r"C:\Program Files\Chromium\Application\chrome.exe",
         ]
+
+    @classmethod
+    def _get_cached_resolved_url(cls, url: str) -> Optional[str]:
+        cache_entry = cls._url_resolution_cache.get(url)
+        if not cache_entry:
+            return None
+
+        resolved_url, expires_at = cache_entry
+        if time.time() >= expires_at:
+            cls._url_resolution_cache.pop(url, None)
+            return None
+
+        logging.info(f"⚡ 命中浏览器解析缓存: {url}")
+        return resolved_url
+
+    @classmethod
+    def _store_resolved_url(cls, url: str, resolved_url: str) -> None:
+        if not url or not resolved_url:
+            return
+        cls._url_resolution_cache[url] = (
+            resolved_url,
+            time.time() + cls.URL_RESOLUTION_CACHE_TTL
+        )
     
     def _find_chrome_executable(self) -> Optional[str]:
         """
@@ -253,7 +290,7 @@ class BrowserService:
             'icon',
             'logo',
         ]
-        if any(keyword in url_lower for keyword in blocked_keywords):
+        if any(keyword in urlparse(url).path.lower() for keyword in blocked_keywords):
             return -1000
 
         score = 0
@@ -1246,6 +1283,298 @@ class BrowserService:
             logging.error(f"❌ 浏览器服务启动失败: {e}")
             raise e
     
+    def _prepare_818ps_driver(self, uc, version):
+        """Reuse a matching binary, or download once with bounded HTTP requests."""
+        patcher = uc.Patcher(version_main=version)
+        local_paths = [patcher.executable_path]
+        if version is not None:
+            local_paths.insert(0, os.path.join(patcher.data_path, '818ps-drivers', str(version), 'chromedriver.exe'))
+        for path in local_paths:
+            if not os.path.isfile(path):
+                continue
+            try:
+                result = subprocess.run([path, '--version'], capture_output=True, text=True, timeout=3,
+                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                match = re.search(r'ChromeDriver\s+(\d+)', result.stdout)
+                if match and version is not None and int(match.group(1)) == version:
+                    return path
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+        root = 'https://googlechromelabs.github.io/chrome-for-testing/'
+        manifest = ('latest-versions-per-milestone-with-downloads.json' if version is not None
+                    else 'last-known-good-versions-with-downloads.json')
+        with urlopen(root + manifest, timeout=6) as response:
+            data = json.loads(response.read(4_000_000))
+        release = data['milestones'][str(version)] if version is not None else data['channels']['Stable']
+        download = next(item['url'] for item in release['downloads']['chromedriver']
+                        if item['platform'] == patcher.platform_name)
+        target_dir = os.path.join(patcher.data_path, '818ps-drivers', release['version'].split('.')[0])
+        os.makedirs(target_dir, exist_ok=True)
+        filename = 'chromedriver.exe' if os.name == 'nt' else 'chromedriver'
+        target = os.path.join(target_dir, filename)
+        with tempfile.TemporaryDirectory(prefix='818ps-driver-', dir=target_dir) as temp_dir:
+            archive = os.path.join(temp_dir, 'driver.zip')
+            deadline = time.monotonic() + 15
+            with urlopen(download, timeout=5) as response, open(archive, 'wb') as output:
+                read_chunk = getattr(response, 'read1', response.read)
+                while True:
+                    chunk = read_chunk(65536)
+                    if not chunk:
+                        break
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('818ps driver download exceeded 15 seconds')
+                    output.write(chunk)
+            with zipfile.ZipFile(archive) as package:
+                member = next(name for name in package.namelist() if name.split('/')[-1] == filename)
+                staging = os.path.join(temp_dir, filename)
+                with open(staging, 'wb') as output:
+                    output.write(package.read(member))
+            if os.name != 'nt':
+                os.chmod(staging, 0o755)
+            os.replace(staging, target)
+        return target
+
+    def _get_818ps_driver(self):
+        """818ps owns one driver; allow only one startup fallback."""
+        import undetected_chromedriver as uc
+        if self.driver:
+            return self.driver
+        chrome_path = self._find_chrome_executable()
+        if not chrome_path:
+            raise RuntimeError('未找到 Chrome 浏览器')
+        fingerprint = (chrome_path, os.path.getmtime(chrome_path))
+        if fingerprint not in self._chrome_versions:
+            self._chrome_versions[fingerprint] = self._get_chrome_version()
+        version = self._chrome_versions[fingerprint]
+        cache_key = (chrome_path, version)
+        for attempt in range(2):
+            options = self._build_chrome_options(uc, chrome_path, True)
+            options.page_load_strategy = 'eager'
+            options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            kwargs = self._build_driver_kwargs(options, version)
+            cached_path = self._driver_paths.get(cache_key)
+            try:
+                if not cached_path or not os.path.isfile(cached_path):
+                    cached_path = self._prepare_818ps_driver(uc, version)
+                kwargs['driver_executable_path'] = cached_path
+                self.driver = uc.Chrome(**kwargs)
+                self._make_818ps_close_idempotent(self.driver)
+                self.driver.set_page_load_timeout(15)
+                self.driver.set_script_timeout(5)
+                self.driver.implicitly_wait(0)
+                self.driver.execute_cdp_cmd('Network.enable', {})
+                driver_path = getattr(getattr(self.driver, 'service', None), 'path', None)
+                if driver_path:
+                    self._driver_paths[cache_key] = driver_path
+                if version is not None:
+                    self._chrome_versions[fingerprint] = version
+                return self.driver
+            except Exception as error:
+                if self.driver:
+                    try:
+                        self.driver.quit()
+                    except Exception:
+                        pass
+                    self.driver = None
+                self._driver_paths.pop(cache_key, None)
+                logging.getLogger('demark.818ps').warning(
+                    '[浏览器启动] request_id=%s attempt=%s error=%s reason=%s', self.request_id, attempt + 1,
+                    type(error).__name__, error)
+                if attempt:
+                    raise
+                inferred = self._extract_browser_version_from_error(error)
+                version = inferred or (None if version is not None else version)
+                cache_key = (chrome_path, version)
+
+    def _make_818ps_close_idempotent(self, driver):
+        # UC's destructor invokes quit again on Windows after explicit shutdown.
+        # An instance guard prevents the duplicate shutdown and WinError 6 noise.
+        quit_driver = driver.quit
+        closed = False
+
+        def close_once():
+            nonlocal closed
+            if closed:
+                return
+            closed = True
+            try:
+                quit_driver()
+            except OSError as error:
+                if getattr(error, 'winerror', None) != 6:
+                    raise
+        driver.quit = close_once
+
+    def _read_818ps_network(self):
+        """Keep JSON responses until loadingFinished, when CDP can read the body."""
+        payloads = []
+        try:
+            logs = self.driver.get_log('performance')
+        except Exception:
+            return payloads
+        for entry in logs:
+            try:
+                message = json.loads(entry['message'])['message']
+                method, params = message['method'], message.get('params', {})
+                request_id = params.get('requestId')
+                if method == 'Network.requestWillBeSent':
+                    request = params.get('request', {})
+                    image_url = request.get('url', '')
+                    host = urlparse(image_url).hostname or ''
+                    if host.endswith(('.818ps.com', '.tuguaishou.com')):
+                        headers = {key: value for key, value in request.get('headers', {}).items()
+                                   if key.lower() in ('referer', 'origin', 'cookie', 'user-agent')}
+                        if headers:
+                            self._818ps_request_headers[image_url] = headers
+                elif method == 'Network.responseReceived':
+                    response = params.get('response', {})
+                    host = urlparse(response.get('url', '')).hostname or ''
+                    if ((host == '818ps.com' or host.endswith('.818ps.com'))
+                            and ('json' in response.get('mimeType', '') or '/api' in response.get('url', ''))):
+                        self._818ps_pending_responses[request_id] = response
+                elif method == 'Network.loadingFinished' and request_id in self._818ps_pending_responses:
+                    response = self._818ps_pending_responses.pop(request_id)
+                    if params.get('encodedDataLength', 0) > 8_000_000:
+                        continue
+                    body = self.driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': request_id})
+                    content = base64.b64decode(body['body']) if body.get('base64Encoded') else body['body']
+                    payloads.append(json.loads(content))
+                elif method == 'Network.loadingFailed':
+                    self._818ps_pending_responses.pop(request_id, None)
+            except (ValueError, KeyError, TypeError):
+                continue
+            except Exception as error:
+                logging.getLogger('demark.818ps').debug('Network body unavailable: %s', type(error).__name__)
+        return payloads
+
+    def _snapshot_818ps(self):
+        snapshot = self._capture_dynamic_snapshot(self.driver)
+        snapshot['networkData'] = self._read_818ps_network()
+        snapshot['requestHeadersByUrl'] = dict(self._818ps_request_headers)
+        snapshot['currentUrl'] = self.driver.current_url
+        # Explicit total labels are evidence; visible page markers alone are not.
+        snapshot['expectedPageCount'] = self.driver.execute_script("""
+            var text = document.body ? document.body.innerText : '';
+            var matches = Array.from(text.matchAll(/共\\s*(\\d+)\\s*(?:页|个画板)/g));
+            return matches.length ? Math.max(...matches.map(m => Number(m[1]))) : null;
+        """)
+        return snapshot
+
+    def _merge_818ps_snapshot(self, snapshot):
+        network = self._818ps_capture.get('networkData', []) + snapshot.get('networkData', [])
+        expected = max(self._818ps_capture.get('expectedPageCount') or 0,
+                       snapshot.get('expectedPageCount') or 0)
+        self._818ps_capture = self._merge_dynamic_capture(self._818ps_capture, snapshot)
+        self._818ps_capture.update(networkData=network, expectedPageCount=expected or None,
+                                   currentUrl=snapshot.get('currentUrl'),
+                                   requestHeadersByUrl=snapshot.get('requestHeadersByUrl', {}))
+        return self._818ps_capture
+
+    async def open_818ps_page(self, url: str):
+        operation = asyncio.create_task(asyncio.to_thread(self._open_818ps_page, url))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # A thread cannot be cancelled while Chrome is starting. Wait for ownership
+            # to become definite before the task's finally closes the driver.
+            await asyncio.gather(operation, return_exceptions=True)
+            raise
+
+    def _open_818ps_page(self, url):
+        from selenium.common.exceptions import TimeoutException
+        driver = self._get_818ps_driver()
+        try:
+            driver.get(url)
+        except TimeoutException:
+            # An editor can remain useful while analytics requests time out.
+            logging.getLogger('demark.818ps').debug('Navigation timed out; inspect loaded DOM')
+        deadline = time.monotonic() + 6
+        while True:
+            snapshot = self._snapshot_818ps()
+            self._merge_818ps_snapshot(snapshot)
+            redirected = snapshot.get('currentUrl') != url and 'share_id=' in snapshot.get('currentUrl', '')
+            if (redirected or self._has_818ps_page_data(snapshot.get('networkData'))
+                    or self._has_818ps_page_data(snapshot.get('jsonData'))
+                    or self._has_818ps_page_data(snapshot.get('windowData'))
+                    or snapshot.get('pageMarkers') or self._main_818ps_preview(snapshot)):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+        return self._818ps_capture
+
+    def _has_818ps_page_data(self, data):
+        if isinstance(data, list):
+            return any(self._has_818ps_page_data(item) for item in data)
+        if isinstance(data, dict):
+            return any((key in ('preview', 'previews', 'page_map', 'pageInfo', 'pages', 'artboards')
+                        and isinstance(value, (dict, list)) and bool(value))
+                       or self._has_818ps_page_data(value) for key, value in data.items())
+        return False
+
+    async def capture_818ps_pages(self, missing_pages, known_pages=None, discover=False):
+        operation = asyncio.create_task(asyncio.to_thread(self._capture_818ps_pages, missing_pages, known_pages, discover))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await asyncio.gather(operation, return_exceptions=True)
+            raise
+
+    def _capture_818ps_pages(self, missing_pages, known_pages=None, discover=False):
+        if not self.driver:
+            return {}
+        targets = set(missing_pages)
+        if discover:
+            for round_index in range(4):
+                state = self._scroll_dynamic_page(self.driver, round_index)
+                time.sleep(0.15)
+                self._merge_818ps_snapshot(self._snapshot_818ps())
+                if not state.get('moved'):
+                    break
+            for label in self._818ps_capture.get('pageMarkers', []):
+                page = self._extract_page_number(label)
+                if page:
+                    targets.add(page)
+            expected = self._818ps_capture.get('expectedPageCount')
+            if expected:
+                targets.update(range(1, expected + 1))
+        targets.difference_update(known_pages or [])
+        snapshots = []
+        for page in sorted(targets):
+            before = self._snapshot_818ps()
+            before_preview = self._main_818ps_preview(before)
+            self._merge_818ps_snapshot(before)
+            activation = self._activate_dynamic_page(self.driver, page)
+            marker_deadline = time.monotonic() + 3
+            while not activation.get('clicked') and time.monotonic() < marker_deadline:
+                time.sleep(0.15)
+                self._merge_818ps_snapshot(self._snapshot_818ps())
+                activation = self._activate_dynamic_page(self.driver, page)
+            if not activation.get('clicked'):
+                continue
+            deadline = time.monotonic() + 3
+            stable_preview = None
+            while time.monotonic() < deadline:
+                snapshot = self._snapshot_818ps()
+                self._merge_818ps_snapshot(snapshot)
+                preview = self._main_818ps_preview(snapshot)
+                # Require an updated, stable main preview, not a sidebar/resource URL.
+                if preview and preview != before_preview and preview == stable_preview:
+                    snapshot.update(page=page, previewUrls=[preview], previewUpdated=True,
+                                    activation=activation)
+                    snapshots.append(snapshot)
+                    break
+                stable_preview = preview
+                time.sleep(0.15)
+        result = dict(self._818ps_capture)
+        result['pageSnapshots'] = snapshots
+        return result
+
+    def _main_818ps_preview(self, snapshot):
+        visible = [item for item in snapshot.get('visibleCandidates', [])
+                   if item.get('isLarge') and item.get('isCentered') and item.get('visibleArea', 0) > 0]
+        urls = self._select_snapshot_preview_urls({'visibleCandidates': visible}, limit=1)
+        return urls[0] if urls else None
+
     async def get_page_content(self, url: str, headless: bool = True) -> Optional[str]:
         """
         获取页面内容
@@ -1642,6 +1971,10 @@ class BrowserService:
         """
         driver = None
         try:
+            cached_url = self._get_cached_resolved_url(url)
+            if cached_url:
+                return cached_url
+
             logging.info(f"🌐 使用本地浏览器解析最终地址: {url}")
             driver = self._get_stealth_driver(headless=headless)
             driver.get(url)
@@ -1665,6 +1998,7 @@ class BrowserService:
                 resolved_url = resolved_url.strip()
 
             if resolved_url:
+                self._store_resolved_url(url, resolved_url)
                 logging.info(f"✅ 浏览器最终地址: {resolved_url}")
                 return resolved_url
 
@@ -1806,8 +2140,12 @@ class BrowserService:
         """关闭浏览器服务"""
         if self.driver:
             try:
-                self.driver.quit()
-                logging.info("✅ 浏览器服务已关闭")
+                if self.request_id:
+                    await asyncio.to_thread(self.driver.quit)
+                    logging.getLogger('demark.818ps').debug('Browser closed request_id=%s', self.request_id)
+                else:
+                    self.driver.quit()
+                    logging.info("✅ 浏览器服务已关闭")
             except:
                 pass
             finally:
